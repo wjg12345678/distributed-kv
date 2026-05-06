@@ -1,5 +1,11 @@
 # Distributed KV
 
+[![Release](https://img.shields.io/github/v/release/wjg12345678/distributed-kv?display_name=tag)](https://github.com/wjg12345678/distributed-kv/releases)
+[![Stars](https://img.shields.io/github/stars/wjg12345678/distributed-kv)](https://github.com/wjg12345678/distributed-kv/stargazers)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C)
+![Raft](https://img.shields.io/badge/Consensus-Raft-F28E2B)
+![RocksDB](https://img.shields.io/badge/Storage-RocksDB-2E8B57)
+
 `distributed-kv` 是一个面向教学和实验的 C++17 分布式 KV 原型。项目把 Raft 共识、KV 状态机、RocksDB 持久化、最小 HTTP 接口以及多进程 TCP 通信放在同一个仓库里，方便同时观察算法行为和系统边界。
 
 它不是生产级数据库，更适合作为以下场景的参考实现：
