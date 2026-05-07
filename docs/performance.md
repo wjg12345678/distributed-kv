@@ -1,11 +1,11 @@
-# Distributed KV Performance Notes
+# 分布式 KV 性能记录
 
-这份文档记录当前仓库一组可复现的本地 benchmark，目标是给秋招面试提供“我不只实现了功能，还真正拉起多进程集群跑过压测”的证据。
+这份文档记录一组可复现的本地压测结果，用于观察多进程集群在回环网络下的吞吐和延迟特征。
 
 ## 测试对象
 
 - 可执行文件：`./build/distributed_kv_network_node`
-- 运行形态：本机 loopback 上的 3 节点多进程集群
+- 运行形态：本机回环网络上的 3 节点多进程集群
 - 状态机后端：RocksDB
 - 接口：
   - `GET /kv/bench`
@@ -13,14 +13,14 @@
 
 说明：
 
-- 每轮 benchmark 都在 fresh cluster 上单独运行，避免上一轮压测污染下一轮结果
+- 每轮压测都在全新集群上单独运行，避免上一轮压测污染下一轮结果
 - `GET /kv/<key>` 不是“leader 直接读本地内存”，当前实现会先做 leader 多数派确认，再读取状态机
-- HTTP server 仍然是最小手写实现，响应默认 `Connection: close`
+- HTTP 服务仍然是最小手写实现，响应默认 `Connection: close`
 
 ## 环境
 
-- OS：macOS 14.7.2
-- Kernel：Darwin 23.6.0 x86_64
+- 操作系统：macOS 14.7.2
+- 内核：Darwin 23.6.0 x86_64
 - 日期：2026-05-07
 
 ## 复现方式
@@ -42,7 +42,7 @@ cmake --build build -j
 脚本会自动：
 
 - 拉起本地 3 节点集群
-- 探测当前 leader
+- 探测当前主节点
 - 预热 `bench` key
 - 将原始输出保存到 `/tmp/distributed-kv-local-cluster/bench/get.txt` 和 `/tmp/distributed-kv-local-cluster/bench/put.txt`
 
@@ -57,7 +57,7 @@ cmake --build build -j
 
 - GET 的中位延迟明显低于 PUT，但它仍然要先做多数派确认，所以吞吐不会像“裸本地读”那样高
 - PUT 吞吐显著低于 GET，因为它要真正走日志复制、提交和状态机 apply
-- 多进程 loopback 结果比单进程演示入口更接近真实分布式形态，但仍然不是跨机器部署基准
+- 多进程回环网络结果比单进程本地入口更接近真实分布式形态，但仍然不是跨机器部署基准
 - p99 明显高于 p50，说明在最小实现里尾延迟仍受连接关闭、线程调度、RocksDB 写入和 Raft RPC 往返影响
 
 ## 原始输出
@@ -98,14 +98,12 @@ Requests/sec:    216.79
 Transfer/sec:     18.84KB
 ```
 
-## 面试时怎么说
+## 结果解读
 
-可以直接概括成下面这句话：
+本地 3 节点多进程集群上一组 `wrk` 基线结果如下：线性一致 `GET` 约 540 req/s，`PUT` 约 217 req/s。由于 `GET` 仍需先完成多数派确认，因此吞吐不会接近纯本地缓存读；而 `PUT` 需要完整经过复制、提交和状态机应用路径，所以整体延迟更高。
 
-我用本地 3 节点多进程集群做过一轮 `wrk` 压测。线性一致 `GET` 大约 540 req/s，`PUT` 大约 217 req/s。因为 GET 不是裸本地读，而是先做多数派确认，所以它的吞吐不会像缓存那样高，但中位延迟仍明显低于 PUT。
+## 测试说明
 
-## 局限
-
-- 这是单机 loopback 环境，不是跨机器生产网络
-- 当前 HTTP server 默认 `Connection: close`，没有 keep-alive、连接池和批量提交优化
-- benchmark 更适合作为“做过性能验证”的证据，而不是对外宣称的最终性能指标
+- 这是单机回环网络环境，不是跨机器生产网络
+- 当前 HTTP 服务默认 `Connection: close`，没有 keep-alive、连接池和批量提交优化
+- 这些结果更适合作为本地性能基线和链路观察数据，而不是跨环境横向对比指标

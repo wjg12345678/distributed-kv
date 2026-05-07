@@ -12,11 +12,11 @@ PID_DIR="$RUNTIME_DIR/pids"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run_local_cluster.sh <start|stop|restart|status>
+用法：scripts/run_local_cluster.sh <start|stop|restart|status>
 
-Environment overrides:
-  BUILD_DIR    Build directory containing distributed_kv_network_node
-  RUNTIME_DIR  Runtime directory for node data, logs and pid files
+可覆盖的环境变量：
+  BUILD_DIR    包含 distributed_kv_network_node 的构建目录
+  RUNTIME_DIR  节点数据、日志和 pid 文件的运行目录
 EOF
 }
 
@@ -47,8 +47,8 @@ node_pid_file() {
 
 require_binary() {
   if [[ ! -x "$BINARY" ]]; then
-    echo "missing binary: $BINARY" >&2
-    echo "run: cmake -S . -B build && cmake --build build -j" >&2
+    echo "缺少可执行文件：$BINARY" >&2
+    echo "请先执行：cmake -S . -B build && cmake --build build -j" >&2
     exit 1
   fi
 }
@@ -88,7 +88,7 @@ start_node() {
   local pid_file
   pid_file="$(node_pid_file "$node_id")"
   if pid_is_running "$pid_file"; then
-    echo "node $node_id is already running" >&2
+    echo "节点 $node_id 已经在运行" >&2
     return 1
   fi
 
@@ -123,7 +123,7 @@ start_cluster() {
   mkdir -p "$DATA_DIR" "$LOG_DIR" "$PID_DIR"
   for node_id in 1 2 3; do
     if pid_is_running "$(node_pid_file "$node_id")"; then
-      echo "cluster appears to be running already" >&2
+      echo "集群似乎已经在运行" >&2
       status_cluster
       exit 1
     fi
@@ -137,7 +137,7 @@ start_cluster() {
 
   sleep 1
   status_cluster
-  echo "logs: $LOG_DIR"
+  echo "日志目录：$LOG_DIR"
 }
 
 stop_cluster() {
@@ -150,17 +150,17 @@ status_cluster() {
   for node_id in 1 2 3; do
     local pid_file
     pid_file="$(node_pid_file "$node_id")"
-    local state="stopped"
+    local state="已停止"
     local pid="-"
     if pid_is_running "$pid_file"; then
       pid="$(<"$pid_file")"
-      state="running"
+      state="运行中"
     elif [[ -f "$pid_file" ]]; then
       pid="$(<"$pid_file")"
       rm -f "$pid_file"
     fi
 
-    printf 'node=%d pid=%s raft_port=%s http_port=%s state=%s\n' \
+    printf '节点=%d pid=%s raft_port=%s http_port=%s 状态=%s\n' \
       "$node_id" \
       "$pid" \
       "$(node_raft_port "$node_id")" \

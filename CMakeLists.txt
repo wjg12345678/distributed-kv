@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(distributed_kv_demo LANGUAGES CXX)
+project(distributed_kv LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,8 +44,8 @@ target_include_directories(distributed_kv PUBLIC include ${CMAKE_CURRENT_BINARY_
 target_include_directories(distributed_kv PRIVATE ${ROCKSDB_INCLUDE_DIR} ${Protobuf_INCLUDE_DIRS})
 target_link_libraries(distributed_kv PUBLIC ${ROCKSDB_LIBRARY} protobuf::libprotobuf PkgConfig::PROTOBUF_ABSL)
 
-add_executable(distributed_kv_demo apps/demo_main.cpp)
-target_link_libraries(distributed_kv_demo PRIVATE distributed_kv)
+add_executable(distributed_kv_single_process apps/single_process_main.cpp)
+target_link_libraries(distributed_kv_single_process PRIVATE distributed_kv)
 
 add_executable(raft_smoke_test tests/unit/raft_smoke_test.cpp)
 target_link_libraries(raft_smoke_test PRIVATE distributed_kv)

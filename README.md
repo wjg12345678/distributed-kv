@@ -1,4 +1,4 @@
-# Distributed KV
+# 分布式 KV
 
 [![Release](https://img.shields.io/github/v/release/wjg12345678/distributed-kv?display_name=tag)](https://github.com/wjg12345678/distributed-kv/releases)
 [![Stars](https://img.shields.io/github/stars/wjg12345678/distributed-kv)](https://github.com/wjg12345678/distributed-kv/stargazers)
@@ -6,29 +6,14 @@
 ![Raft](https://img.shields.io/badge/Consensus-Raft-F28E2B)
 ![RocksDB](https://img.shields.io/badge/Storage-RocksDB-2E8B57)
 
-`distributed-kv` 是一个面向教学和实验的 C++17 分布式 KV 原型。项目把 Raft 共识、KV 状态机、RocksDB 持久化、最小 HTTP 接口以及多进程 TCP 通信放在同一个仓库里，方便同时观察算法行为和系统边界。
+`distributed-kv` 是一个基于 C++17 实现的分布式键值存储系统，聚焦高一致性数据复制与状态机编排，覆盖了 Raft 共识、KV 状态机、RocksDB 持久化、HTTP 接入层以及多进程 TCP 通信。
 
-它不是生产级数据库，更适合作为以下场景的参考实现：
+仓库同时提供单进程和多进程两种运行形态，便于在本地完成集群启动、读写验证、日志复制、快照恢复和状态机能力测试。
 
-- 阅读 Raft 选举、日志复制、冲突回退和快照流程
-- 验证状态机复制如何落到 KV、锁服务和 MVCC 接口上
-- 在单进程和多进程两种运行方式之间切换，做功能实验
-
-## 秋招速览
-
-如果把这个仓库当作秋招面试项目，可以先抓这几个点：
-
-- 分布式核心：Leader 选举、日志复制、冲突回退、快照、持久化
-- 正确性边界：Pre-Vote、仅推进当前 Term 日志 commit、ReadIndex 风格线性一致读
-- 工程形态：单进程 demo + 多进程真实 TCP 集群 + HTTP API + Prometheus 风格 metrics
-- 状态机扩展：KV、分布式锁、简化版 MVCC
-- 当前边界：成员变更仍是教学版简化实现，不是 joint consensus
-
-如果你是为了准备面试，建议配合阅读 [docs/interview_guide.md](docs/interview_guide.md)。
-
-进一步的图示和压测结果可以看：
+进一步的图示、实现说明和压测结果可以参考：
 
 - [docs/architecture.md](docs/architecture.md)
+- [docs/implementation_notes.md](docs/implementation_notes.md)
 - [docs/performance.md](docs/performance.md)
 
 ## 已实现能力
@@ -46,33 +31,39 @@
 - 最小 HTTP 接口
 - 基础输入校验和 `400 Bad Request` 错误返回
 - 锁服务
-- 简化版 MVCC 读写与写写冲突检测
-- 简化版成员动态变更接口
-- 基础 metrics 输出
-- `CTest` 回归测试和 GitHub Actions CI
-- 本地 3 节点启动 / demo / benchmark 脚本
+- MVCC 读写与写写冲突检测
+- 成员动态变更接口
+- 基础指标输出
+- `CTest` 回归测试和 GitHub Actions 持续集成
+- 本地 3 节点启动 / 快速验证 / 压测脚本
+
+## 适用场景
+
+- 配置中心、元数据管理等需要强一致写入确认的场景
+- 分布式锁、协调状态、轻量事务等需要一致性状态机承载的场景
+- 本地集群验证、协议联调和存储链路性能分析
 
 ## 架构概览
 
 ```text
-Client
+客户端
   |
   v
-HTTP API
+HTTP 接口
   |
   v
-Leader RaftNode
+Leader 节点
   |
-  +--> append log entry
-  +--> replicate to followers over TCP + Protobuf
-  +--> commit after majority ack
-  +--> apply to state machine
+  +--> 追加日志
+  +--> 通过 TCP + Protobuf 复制到 follower
+  +--> 多数派确认后提交
+  +--> 应用到状态机
               |
               +--> KV
-              +--> Lock
+              +--> 锁服务
               +--> MVCC
   |
-  +--> persist Raft metadata and state machine snapshots via RocksDB
+  +--> 通过 RocksDB 持久化 Raft 元数据与状态机快照
 ```
 
 读写路径可以概括为：
@@ -107,7 +98,7 @@ tests/unit/           功能测试
 - `pkg-config`
 - RocksDB
 
-注意：当前 `CMakeLists.txt` 会始终链接 RocksDB，所以即使你只想运行内存版 demo，也需要本机先安装 RocksDB 开发库和头文件。
+注意：当前 `CMakeLists.txt` 会始终链接 RocksDB，所以即使你只想运行内存版单进程节点，也需要本机先安装 RocksDB 开发库和头文件。
 
 ## 构建
 
@@ -118,26 +109,26 @@ cmake --build build -j
 
 构建完成后会生成这些主要二进制：
 
-- `build/distributed_kv_demo`：单进程、内存版 3 节点演示
+- `build/distributed_kv_single_process`：单进程、内存版 3 节点实例
 - `build/distributed_kv_http_server`：单进程、RocksDB 版 HTTP 服务
 - `build/distributed_kv_network_node`：多进程、真实 TCP 网络节点
 - `build/raft_*_test`：功能测试
 
 ## 运行方式
 
-### 1. 单进程内存版 Demo
+### 1. 单进程内存版实例
 
 这个入口把 3 个节点放在同一进程里，通过 `Cluster` 直接转发 Raft RPC，便于阅读和调试。
 
 ```bash
-./build/distributed_kv_demo
+./build/distributed_kv_single_process
 ```
 
 它会自动完成一次 leader 选举，并向状态机写入两条 KV 数据。
 
-### 2. 单进程 HTTP Server
+### 2. 单进程 HTTP 服务
 
-这个入口仍然是单进程 3 节点集群，但底层状态机和 Raft 元数据使用 RocksDB 持久化。启动时会清空以下目录，因此它更适合本地演示，不适合保留历史数据：
+这个入口仍然是单进程 3 节点集群，但底层状态机和 Raft 元数据使用 RocksDB 持久化。启动时会清空以下目录，适合本地验证与接口调试：
 
 - `/tmp/distributed-kv-rocksdb-node1`
 - `/tmp/distributed-kv-rocksdb-node2`
@@ -161,12 +152,12 @@ curl http://127.0.0.1:9006/kv/name
 
 这个入口只暴露最小 KV API：
 
-- `PUT /kv/<key>`：请求体原样作为 value
-- `GET /kv/<key>`：leader 先做多数派确认，再读取 value
+- `PUT /kv/<key>`：请求体原样作为值
+- `GET /kv/<key>`：leader 先做多数派确认，再读取值
 
-### 3. 多进程真实网络版
+### 3. 多进程集群版
 
-这是最接近“分布式系统”形态的入口。每个节点是独立进程，拥有：
+这是最接近实际部署形态的入口。每个节点是独立进程，拥有：
 
 - 独立的 Raft RPC 端口
 - 独立的 HTTP 端口
@@ -216,7 +207,7 @@ curl http://127.0.0.1:9006/kv/name
 - `<data-dir>/store`：KV 状态机
 - `<data-dir>/meta`：Raft 持久化状态
 
-查看 leader：
+查看主节点：
 
 ```bash
 curl http://127.0.0.1:9201/status
@@ -235,22 +226,22 @@ curl http://127.0.0.1:9201/kv/alpha
 
 ### 4. 本地 3 节点脚本
 
-如果只是想快速演示，不想手动开 3 个终端，可以直接使用仓库里的脚本：
+如果想快速启动本地 3 节点集群，而不手动打开 3 个终端，可以直接使用仓库里的脚本：
 
 ```bash
 ./scripts/run_local_cluster.sh start
 ./scripts/run_local_cluster.sh status
-./scripts/demo_local_cluster.sh
+./scripts/verify_local_cluster.sh
 ./scripts/run_local_cluster.sh stop
 ```
 
 说明：
 
 - `scripts/run_local_cluster.sh` 支持 `start|stop|restart|status`
-- `scripts/demo_local_cluster.sh` 会自动启动集群、写入一条 KV、展示 follower 的 `307 Temporary Redirect`，再读取指标
+- `scripts/verify_local_cluster.sh` 会自动启动集群、写入一条 KV、验证从节点返回的 `307 Temporary Redirect`，再读取指标
 - 默认运行目录是 `/tmp/distributed-kv-local-cluster`
 
-## 多进程节点 HTTP API
+## 多进程节点 HTTP 接口
 
 以下接口由 `distributed_kv_network_node` 暴露。
 
@@ -264,7 +255,7 @@ curl http://127.0.0.1:9201/kv/alpha
 ### KV
 
 - `PUT /kv/<key>`
-  - 请求体原样作为 value
+  - 请求体原样作为值
 - `GET /kv/<key>`
 
 示例：
@@ -296,7 +287,7 @@ curl -L -X POST http://127.0.0.1:9201/lock/release -d 'name=deploy&owner=worker-
 - `POST /mvcc/begin`
   - 返回 `tx_id` 和 `snapshot_ts`
 - `PUT /mvcc/tx/<tx_id>/kv/<key>`
-  - 请求体原样作为待提交 value
+  - 请求体原样作为待提交的值
 - `POST /mvcc/commit`
   - 表单参数：`tx_id=<tx_id>`
   - 成功返回 `commit_ts=<ts>`
@@ -317,7 +308,7 @@ curl -L "http://127.0.0.1:9201/mvcc/kv/order?snapshot_ts=1"
 
 ### 成员变更
 
-当前实现的是教学版的简化成员变更，不是 Raft joint consensus。
+当前成员变更接口采用直接配置变更流程，不包含 Raft joint consensus。
 
 - `POST /admin/add-peer`
   - 表单参数：`id=<id>&host=<host>&raft_port=<raft_port>&http_port=<http_port>`
@@ -394,7 +385,7 @@ ctest --test-dir build --output-on-failure
 ./build/raft_linearizable_read_test
 ```
 
-仓库还包含 GitHub Actions CI 配置：
+仓库还包含 GitHub Actions 持续集成配置：
 
 - `.github/workflows/ci.yml`
 - 默认流程：安装依赖、`cmake` 构建、`ctest` 回归
@@ -411,29 +402,16 @@ ctest --test-dir build --output-on-failure
 脚本会：
 
 - 自动拉起本地 3 节点集群
-- 自动探测当前 leader
+- 自动探测当前主节点
 - 预热测试 key
 - 将 `wrk` 原始输出保存到 `/tmp/distributed-kv-local-cluster/bench`
 
 当前记录的一组本地结果见 [docs/performance.md](docs/performance.md)。
 
-## 面试建议
+## 工程说明
 
-如果面试官追问“这个项目和普通 KV demo 的区别”，建议优先讲下面 4 点：
-
-- 不是单机内存玩具，而是有多进程 TCP 通信、独立数据目录和真实 leader/follower 角色切换
-- 不只实现了基础选举和复制，还补了 Pre-Vote 与线性一致读这两个常见正确性边界
-- 状态机不只有 KV，还扩展了锁服务和 MVCC，因此可以展示 Raft 之上的业务语义
-- 有成组功能测试覆盖选举、冲突、快照、持久化、成员变更和分区场景
-
-更细的话术和高频问题可以看 [docs/interview_guide.md](docs/interview_guide.md)。
-
-## 当前限制
-
-- 这是教学和实验代码，不是生产级数据库实现
-- 成员变更是简化版本，没有实现 joint consensus
-- 线性一致读当前走的是 ReadIndex 风格多数派确认，不是 lease read
-- HTTP server 和 TCP RPC server 都是最小手写实现，没有鉴权、TLS 或复杂流控
-- 多进程 benchmark 目前是单机 loopback 结果，不是跨机器部署数据
-- 还没有做优雅退出、配置文件化和系统化混沌测试
-- 单进程 `distributed_kv_http_server` 启动时会删除已有 `/tmp` 数据目录
+- 成员变更接口当前采用直接配置变更流程，尚未接入 joint consensus
+- 线性一致读采用 ReadIndex 风格多数派确认路径，未引入 lease read
+- HTTP 接口与 TCP RPC 组件聚焦核心数据链路，鉴权、TLS、限流等能力可按部署需求继续扩展
+- 压测结果基于单机回环网络，适合观察节点行为与本地性能特征
+- 单进程 `distributed_kv_http_server` 启动时会清理既有 `/tmp` 数据目录，适合本地验证环境

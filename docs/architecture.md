@@ -1,35 +1,35 @@
-# Distributed KV Architecture
+# 分布式 KV 架构说明
 
-这份文档面向“快速讲清项目结构”的场景，适合在面试前过一遍，或者直接给面试官展示。
+这份文档用于快速了解系统结构、核心数据流和故障恢复链路。
 
 ## 总体架构图
 
 ```mermaid
 flowchart LR
-  Client[Client / curl / benchmark]
+  Client[客户端 / curl / 压测脚本]
 
-  subgraph Service[Node Service]
-    HTTP[HTTP API]
+  subgraph Service[节点服务]
+    HTTP[HTTP 接口]
     Raft[RaftNode]
     RPC[TCP RPC + Protobuf]
-    Metrics[/metrics]
+    Metrics[/metrics 指标]
   end
 
-  subgraph StateMachine[Replicated State Machine]
+  subgraph StateMachine[复制状态机]
     KV[KV]
-    Lock[Lock Service]
+    Lock[锁服务]
     MVCC[MVCC]
   end
 
-  subgraph Storage[Persistence]
-    Meta[Raft Meta]
-    Snap[Snapshot]
+  subgraph Storage[持久化层]
+    Meta[Raft 元数据]
+    Snap[快照]
     Rocks[RocksDB]
   end
 
-  subgraph Cluster[Peer Nodes]
-    Peer1[Peer 1]
-    Peer2[Peer 2]
+  subgraph Cluster[其他节点]
+    Peer1[节点 1]
+    Peer2[节点 2]
   end
 
   Client --> HTTP
@@ -62,20 +62,20 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-  participant C as Client
-  participant L as Leader
-  participant F1 as Follower 1
-  participant F2 as Follower 2
-  participant SM as State Machine
+  participant C as 客户端
+  participant L as 主节点
+  participant F1 as 从节点 1
+  participant F2 as 从节点 2
+  participant SM as 状态机
 
   C->>L: PUT /kv/key
-  L->>L: append log entry
+  L->>L: 追加日志
   L->>F1: AppendEntries
   L->>F2: AppendEntries
-  F1-->>L: ack
-  F2-->>L: ack
-  L->>L: majority commit
-  L->>SM: apply committed entry
+  F1-->>L: 确认
+  F2-->>L: 确认
+  L->>L: 多数派提交
+  L->>SM: 应用已提交日志
   L-->>C: 200 stored
 ```
 
@@ -85,18 +85,18 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-  participant C as Client
-  participant L as Leader
-  participant F1 as Follower 1
-  participant F2 as Follower 2
-  participant SM as State Machine
+  participant C as 客户端
+  participant L as 主节点
+  participant F1 as 从节点 1
+  participant F2 as 从节点 2
+  participant SM as 状态机
 
   C->>L: GET /kv/key
-  L->>F1: heartbeat / quorum confirm
-  L->>F2: heartbeat / quorum confirm
-  F1-->>L: ack
-  F2-->>L: ack
-  L->>SM: read local state machine
+  L->>F1: 心跳 / 多数派确认
+  L->>F2: 心跳 / 多数派确认
+  F1-->>L: 确认
+  F2-->>L: 确认
+  L->>SM: 读取本地状态机
   L-->>C: 200 value
 ```
 
@@ -108,33 +108,33 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-  participant L as Current Leader
-  participant M as Majority Follower
-  participant I as Isolated Follower
+  participant L as 当前主节点
+  participant M as 多数派从节点
+  participant I as 被隔离从节点
 
   Note over L,M,I: 集群已经完成选主并稳定运行
-  L->>M: AppendEntries / Heartbeat
-  L--xI: Heartbeat lost due to partition
+  L->>M: AppendEntries / 心跳
+  L--xI: 分区导致心跳丢失
 
-  Note over I: election timeout
+  Note over I: 选举超时
   I->>L: PreVote(term+1)
   I->>M: PreVote(term+1)
-  L--xI: no response
-  M--xI: no response
+  L--xI: 无响应
+  M--xI: 无响应
   Note over I: 无法拿到多数派，不进入正式选举，不抬高 term
 
-  L->>M: continue heartbeat and replication
+  L->>M: 继续发送心跳与日志复制
   Note over L,M: 多数派一侧继续稳定提供写入和线性一致读
 
   Note over I: 网络恢复
   L->>I: AppendEntries or InstallSnapshot
-  I-->>L: ack
+  I-->>L: 确认
   Note over I: 追平日志 / snapshot 后重新加入集群
 ```
 
-## 面试时可以这样讲
+## 结构要点
 
-- 架构上我把“共识层、传输层、状态机、持久化层、接口层”拆开了，所以既能跑单进程教学版，也能跑多进程真实网络版
-- 写路径强调的是“日志复制后提交再 apply”
-- 读路径强调的是“leader 先做多数派确认再读”
-- 恢复路径强调的是“隔离节点先 Pre-Vote，不乱抬 term；恢复后由 leader 通过 AppendEntries 或 InstallSnapshot 追平”
+- 共识层、传输层、状态机、持久化层和接口层职责清晰，便于分别验证节点行为和数据路径
+- 写路径的关键约束是“先完成日志复制与提交，再应用到状态机”
+- 读路径的关键约束是“leader 先完成多数派确认，再返回状态机结果”
+- 恢复路径的关键约束是“隔离节点先进行 Pre-Vote，恢复后由 leader 通过 AppendEntries 或 InstallSnapshot 追平”

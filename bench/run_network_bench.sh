@@ -26,7 +26,7 @@ wait_for_leader_port() {
     sleep 0.2
   done
 
-  echo "failed to detect leader within timeout" >&2
+  echo "在超时时间内未能探测到主节点" >&2
   return 1
 }
 
@@ -52,11 +52,11 @@ run_benchmark() {
 
   if [[ "$mode" == "get" ]]; then
     local get_output="$OUTPUT_DIR/get.txt"
-    echo "running GET benchmark against leader port ${leader_port}"
+    echo "正在对主节点端口 ${leader_port} 执行 GET 压测"
     wrk -t4 -c16 -d15s --latency -s "$ROOT_DIR/bench/wrk_get.lua" "http://127.0.0.1:${leader_port}" | tee "$get_output"
   else
     local put_output="$OUTPUT_DIR/put.txt"
-    echo "running PUT benchmark against leader port ${leader_port}"
+    echo "正在对主节点端口 ${leader_port} 执行 PUT 压测"
     wrk -t4 -c8 -d15s --latency -s "$ROOT_DIR/bench/wrk_put.lua" "http://127.0.0.1:${leader_port}" | tee "$put_output"
   fi
 
@@ -69,10 +69,10 @@ main() {
     get|put)
       run_benchmark "$mode"
       echo
-      echo "saved benchmark output under: $OUTPUT_DIR"
+      echo "压测输出已保存到：$OUTPUT_DIR"
       ;;
     *)
-      echo "usage: bench/run_network_bench.sh <get|put>" >&2
+      echo "用法：bench/run_network_bench.sh <get|put>" >&2
       exit 1
       ;;
   esac

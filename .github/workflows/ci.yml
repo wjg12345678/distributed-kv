@@ -1,4 +1,4 @@
-name: CI
+name: 持续集成
 
 on:
   push:
@@ -10,12 +10,13 @@ permissions:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    name: 构建与测试
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -28,11 +29,11 @@ jobs:
             librocksdb-dev \
             libabsl-dev
 
-      - name: Configure
+      - name: 配置
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      - name: 构建
         run: cmake --build build
 
-      - name: Test
+      - name: 测试
         run: ctest --test-dir build --output-on-failure

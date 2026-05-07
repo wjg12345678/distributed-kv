@@ -25,7 +25,7 @@ wait_for_leader_port() {
     sleep 0.2
   done
 
-  echo "failed to detect leader within timeout" >&2
+  echo "在超时时间内未能探测到主节点" >&2
   return 1
 }
 
@@ -40,31 +40,31 @@ main() {
     follower_port=9202
   fi
 
-  echo "leader http port: $leader_port"
-  curl -fsS -X PUT "http://127.0.0.1:${leader_port}/kv/demo" -d 'hello-from-demo' >/dev/null
+  echo "主节点 HTTP 端口：$leader_port"
+  curl -fsS -X PUT "http://127.0.0.1:${leader_port}/kv/service" -d 'distributed-kv' >/dev/null
 
   echo
-  echo "direct read from leader:"
-  curl -fsS "http://127.0.0.1:${leader_port}/kv/demo"
-  echo
-
-  echo
-  echo "redirect response from follower:"
-  curl -i --max-time 2 "http://127.0.0.1:${follower_port}/kv/demo"
+  echo "直接从主节点读取："
+  curl -fsS "http://127.0.0.1:${leader_port}/kv/service"
   echo
 
   echo
-  echo "follow redirect and read value:"
-  curl -fsSL "http://127.0.0.1:${follower_port}/kv/demo"
+  echo "Follower 返回的重定向响应："
+  curl -i --max-time 2 "http://127.0.0.1:${follower_port}/kv/service"
   echo
 
   echo
-  echo "selected metrics:"
+  echo "跟随重定向后读取值："
+  curl -fsSL "http://127.0.0.1:${follower_port}/kv/service"
+  echo
+
+  echo
+  echo "选取的指标："
   curl -fsS "http://127.0.0.1:${leader_port}/metrics" | grep -E '^(raft_(append_entries_rpcs_total|linearizable_read_checks_total)|http_requests_total) '
   echo
 
   if [[ "$KEEP_CLUSTER_RUNNING" == "1" ]]; then
-    echo "cluster is still running; stop it with: scripts/run_local_cluster.sh stop"
+    echo "集群仍在运行，可执行以下命令停止：scripts/run_local_cluster.sh stop"
   fi
 }
 
