@@ -1,7 +1,24 @@
 #include "core/cluster.h"
 
 #include <cassert>
+#include <chrono>
 #include <memory>
+#include <thread>
+
+namespace {
+
+template <typename Predicate>
+bool WaitUntil(Predicate&& predicate, int attempts = 100, int sleep_ms = 10) {
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+  }
+  return predicate();
+}
+
+}  // namespace
 
 int main() {
   Cluster cluster;
@@ -45,10 +62,10 @@ int main() {
   for (int id : {1, 2, 3}) {
     auto node = cluster.FindNode(id);
     assert(node);
-    auto value = node->store().Get("k");
-    assert(value.has_value());
-    assert(*value == "v");
-    assert(node->commit_index() == 2);
+    assert(WaitUntil([&]() {
+      const auto value = node->store().Get("k");
+      return value.has_value() && *value == "v" && node->commit_index() >= 2;
+    }));
   }
 
   return 0;

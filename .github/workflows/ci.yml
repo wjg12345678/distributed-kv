@@ -37,3 +37,6 @@ jobs:
 
       - name: 测试
         run: ctest --test-dir build --output-on-failure
+
+      - name: 多进程端到端验证
+        run: RUNTIME_DIR=/tmp/distributed-kv-ci-e2e ./scripts/verify_network_e2e.sh

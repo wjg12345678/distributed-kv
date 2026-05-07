@@ -232,14 +232,17 @@ curl http://127.0.0.1:9201/kv/alpha
 ./scripts/run_local_cluster.sh start
 ./scripts/run_local_cluster.sh status
 ./scripts/verify_local_cluster.sh
+./scripts/verify_network_e2e.sh
 ./scripts/run_local_cluster.sh stop
 ```
 
 说明：
 
 - `scripts/run_local_cluster.sh` 支持 `start|stop|restart|status`
-- `scripts/verify_local_cluster.sh` 会自动启动集群、写入一条 KV、验证从节点返回的 `307 Temporary Redirect`，再读取指标
-- 默认运行目录是 `/tmp/distributed-kv-local-cluster`
+- `scripts/verify_local_cluster.sh` 是多进程 KV smoke 脚本，会自动启动集群、写入一条 KV、验证从节点返回的 `307 Temporary Redirect`，再读取指标
+- `scripts/verify_network_e2e.sh` 是多进程回归脚本，覆盖 failover、锁、MVCC 和成员变更场景，CI 会执行它
+- `scripts/verify_local_cluster.sh` 默认运行目录是 `/tmp/distributed-kv-local-cluster`
+- `scripts/verify_network_e2e.sh` 默认运行目录是 `/tmp/distributed-kv-e2e`
 
 ## 多进程节点 HTTP 接口
 
@@ -250,7 +253,7 @@ curl http://127.0.0.1:9201/kv/alpha
 - `GET /status`
   - 返回节点 ID、角色、term、leader、commit index、peer 数等文本信息
 - `GET /metrics`
-  - 返回 Prometheus 风格的纯文本指标，例如 RPC 次数、提交条数、HTTP 请求数、平均 QPS
+  - 返回纯文本指标，例如 RPC 次数、提交条数、HTTP 请求数、平均 QPS
 
 ### KV
 
@@ -308,7 +311,7 @@ curl -L "http://127.0.0.1:9201/mvcc/kv/order?snapshot_ts=1"
 
 ### 成员变更
 
-当前成员变更接口采用直接配置变更流程，不包含 Raft joint consensus。
+当前成员变更通过 `BeginJointConfig` / `FinalizeConfig` 两阶段日志命令完成，覆盖 add / remove peer 的 joint consensus 风格配置切换。
 
 - `POST /admin/add-peer`
   - 表单参数：`id=<id>&host=<host>&raft_port=<raft_port>&http_port=<http_port>`
@@ -368,9 +371,16 @@ curl -L -X POST http://127.0.0.1:9201/admin/remove-peer \
 - `raft_conflict_test`：日志冲突覆盖
 - `raft_persistence_test`：RocksDB 持久化恢复
 - `raft_snapshot_test`：快照与日志压缩
-- `raft_membership_test`：简化成员变更
+- `raft_membership_test`：两阶段成员变更、移除 leader 和重启恢复
+- `raft_async_replication_test`：异步复制路径与超时场景
+- `tcp_util_timeout_test`：TCP 往返超时控制
 - `raft_lock_test`：分布式锁
 - `raft_mvcc_test`：MVCC 和写写冲突
+
+多进程脚本回归包括：
+
+- `scripts/verify_local_cluster.sh`：KV smoke、follower redirect、指标读取
+- `scripts/verify_network_e2e.sh`：failover、锁、MVCC、成员变更
 
 运行：
 
@@ -388,7 +398,7 @@ ctest --test-dir build --output-on-failure
 仓库还包含 GitHub Actions 持续集成配置：
 
 - `.github/workflows/ci.yml`
-- 默认流程：安装依赖、`cmake` 构建、`ctest` 回归
+- 默认流程：安装依赖、`cmake` 构建、`ctest` 回归，以及多进程 `scripts/verify_network_e2e.sh`
 
 ## 压测
 
@@ -408,9 +418,11 @@ ctest --test-dir build --output-on-failure
 
 当前记录的一组本地结果见 [docs/performance.md](docs/performance.md)。
 
+说明：这组结果是单机回环网络上的 correctness-first 基线，用于观察链路与尾延迟，不适合作为跨机器或生产环境吞吐结论。
+
 ## 工程说明
 
-- 成员变更接口当前采用直接配置变更流程，尚未接入 joint consensus
+- 成员变更当前通过两阶段配置日志完成 add / remove peer，接口仍然偏底层，节点 bootstrap / decommission 需要脚本配合
 - 线性一致读采用 ReadIndex 风格多数派确认路径，未引入 lease read
 - HTTP 接口与 TCP RPC 组件聚焦核心数据链路，鉴权、TLS、限流等能力可按部署需求继续扩展
 - 压测结果基于单机回环网络，适合观察节点行为与本地性能特征

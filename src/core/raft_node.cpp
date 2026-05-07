@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <iomanip>
-#include <mutex>
-#include <random>
 #include <sstream>
 
 namespace {
@@ -62,7 +60,18 @@ std::string SerializeVersionIndex(const std::vector<std::uint64_t>& versions) {
   return out.str();
 }
 
+bool ContainsId(const std::vector<int>& ids, int id) {
+  return std::find(ids.begin(), ids.end(), id) != ids.end();
 }
+
+bool IsConfigCommandType(CommandType type) {
+  return type == CommandType::AddPeer ||
+      type == CommandType::RemovePeer ||
+      type == CommandType::BeginJointConfig ||
+      type == CommandType::FinalizeConfig;
+}
+
+}  // namespace
 
 RaftNode::RaftNode(
     int id,
@@ -72,13 +81,16 @@ RaftNode::RaftNode(
     std::unique_ptr<IKeyValueStore> store,
     std::unique_ptr<IRaftPersistence> persistence)
     : id_(id),
-      peers_(std::move(peers)),
       base_election_timeout_ticks_(election_timeout_ticks),
       store_(std::move(store)),
       persistence_(std::move(persistence)),
       transport_(transport),
       random_engine_(static_cast<std::mt19937::result_type>(
           std::random_device{}() ^ (static_cast<unsigned int>(id) * 0x9e3779b9U))) {
+  peers.push_back(id_);
+  initial_voters_ = NormalizeVoters(std::move(peers));
+  config_voters_ = initial_voters_;
+
   if (persistence_) {
     persistence_->LoadSnapshot(snapshot_state_);
   }
@@ -89,16 +101,6 @@ RaftNode::RaftNode(
     commit_index_ = snapshot_state_.last_included_index;
     last_applied_ = snapshot_state_.last_included_index;
     log_.push_back(LogEntry{snapshot_state_.last_included_term, Command{}});
-    for (const auto& peer : transport_->ListPeers()) {
-      transport_->RemovePeer(peer.id);
-    }
-    peers_.clear();
-    for (const auto& peer : snapshot_state_.peers) {
-      if (peer.id != id_) {
-        peers_.push_back(peer.id);
-        transport_->UpsertPeer(peer);
-      }
-    }
   } else {
     log_.push_back(LogEntry{});
   }
@@ -113,27 +115,37 @@ RaftNode::RaftNode(
       log_.push_back(LogEntry{snapshot_state_.last_included_term, Command{}});
     }
     commit_index_ = std::max(commit_index_, state.commit_index);
-    last_applied_ = log_base_index_;
-    ApplyCommittedEntries();
   }
 
+  RebuildMembershipStateLocked();
+  last_applied_ = log_base_index_;
+  ApplyCommittedEntries();
+  MaybeStepDownIfRemovedLocked();
   ResetElectionTimer();
 }
 
+RaftNode::~RaftNode() = default;
+
 void RaftNode::Tick() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   ++election_elapsed_;
 
   if (role_ == Role::Leader) {
     ++heartbeat_elapsed_;
     if (heartbeat_elapsed_ >= heartbeat_interval_ticks_) {
-      SendHeartbeats();
       heartbeat_elapsed_ = 0;
+      lock.unlock();
+      SendHeartbeats();
     }
     return;
   }
 
+  if (!IsVotingMemberLocked(id_)) {
+    return;
+  }
+
   if (election_elapsed_ >= randomized_election_timeout_ticks_) {
+    lock.unlock();
     StartPreVote();
   }
 }
@@ -147,8 +159,8 @@ bool RaftNode::Propose(const std::string& key, const std::string& value) {
 }
 
 bool RaftNode::ConfirmLeaderForRead() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return ConfirmLeaderForReadLocked();
+  std::unique_lock<std::mutex> lock(mutex_);
+  return ConfirmLeaderForReadLocked(lock);
 }
 
 std::optional<std::string> RaftNode::GetValue(const std::string& key) const {
@@ -157,17 +169,82 @@ std::optional<std::string> RaftNode::GetValue(const std::string& key) const {
 }
 
 bool RaftNode::AddPeer(const PeerEndpoint& peer) {
-  Command command;
-  command.type = CommandType::AddPeer;
-  command.peer = peer;
-  return ReplicateCommand(std::move(command));
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (role_ != Role::Leader || HasUncommittedConfigChangeLocked() || peer.id == id_) {
+    return false;
+  }
+
+  const MembershipConfig current_config = ConfigAtIndexLocked(LastLogIndex());
+  if (current_config.joint) {
+    return false;
+  }
+  if (IsVoterInConfigLocked(current_config, peer.id)) {
+    return true;
+  }
+
+  peer_endpoints_[peer.id] = peer;
+  transport_->UpsertPeer(peer);
+  RefreshReplicationTrackingLocked();
+
+  auto new_voters = current_config.voters;
+  new_voters.push_back(peer.id);
+  new_voters = NormalizeVoters(std::move(new_voters));
+
+  MembershipConfig joint_config{current_config.voters, new_voters, true};
+  MembershipConfig final_config{new_voters, {}, false};
+
+  Command begin_joint;
+  begin_joint.type = CommandType::BeginJointConfig;
+  begin_joint.config_voters = current_config.voters;
+  begin_joint.config_next_voters = new_voters;
+  begin_joint.config_peers = PeerEndpointsForConfigLocked(joint_config);
+
+  Command finalize;
+  finalize.type = CommandType::FinalizeConfig;
+  finalize.config_voters = new_voters;
+  finalize.config_peers = PeerEndpointsForConfigLocked(final_config);
+
+  return AppendEntryAndCommitLocked(lock, std::move(begin_joint)) &&
+      AppendEntryAndCommitLocked(lock, std::move(finalize));
 }
 
 bool RaftNode::RemovePeer(int peer_id) {
-  Command command;
-  command.type = CommandType::RemovePeer;
-  command.peer.id = peer_id;
-  return ReplicateCommand(std::move(command));
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (role_ != Role::Leader || HasUncommittedConfigChangeLocked()) {
+    return false;
+  }
+
+  const MembershipConfig current_config = ConfigAtIndexLocked(LastLogIndex());
+  if (current_config.joint) {
+    return false;
+  }
+  if (!IsVoterInConfigLocked(current_config, peer_id)) {
+    return true;
+  }
+
+  auto new_voters = current_config.voters;
+  new_voters.erase(std::remove(new_voters.begin(), new_voters.end(), peer_id), new_voters.end());
+  new_voters = NormalizeVoters(std::move(new_voters));
+  if (new_voters.empty()) {
+    return false;
+  }
+
+  MembershipConfig joint_config{current_config.voters, new_voters, true};
+  MembershipConfig final_config{new_voters, {}, false};
+
+  Command begin_joint;
+  begin_joint.type = CommandType::BeginJointConfig;
+  begin_joint.config_voters = current_config.voters;
+  begin_joint.config_next_voters = new_voters;
+  begin_joint.config_peers = PeerEndpointsForConfigLocked(joint_config);
+
+  Command finalize;
+  finalize.type = CommandType::FinalizeConfig;
+  finalize.config_voters = new_voters;
+  finalize.config_peers = PeerEndpointsForConfigLocked(final_config);
+
+  return AppendEntryAndCommitLocked(lock, std::move(begin_joint)) &&
+      AppendEntryAndCommitLocked(lock, std::move(finalize));
 }
 
 bool RaftNode::AcquireLock(const std::string& name, const std::string& owner) {
@@ -196,8 +273,8 @@ std::optional<std::string> RaftNode::LockOwner(const std::string& name) const {
 }
 
 std::optional<MvccTransaction> RaftNode::BeginMvccTransaction() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!ConfirmLeaderForReadLocked()) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!ConfirmLeaderForReadLocked(lock)) {
     return std::nullopt;
   }
 
@@ -231,7 +308,7 @@ bool RaftNode::StageMvccWrite(const std::string& tx_id, const std::string& key, 
 }
 
 MvccCommitResult RaftNode::CommitMvccTransaction(const std::string& tx_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
   if (role_ != Role::Leader) {
     return {};
   }
@@ -262,7 +339,7 @@ MvccCommitResult RaftNode::CommitMvccTransaction(const std::string& tx_id) {
   command.writes = it->second.writes;
 
   CommandResult result;
-  const bool replicated = ReplicateCommandLocked(std::move(command), nullptr, &result);
+  const bool replicated = ReplicateCommandLocked(lock, std::move(command), nullptr, &result);
   pending_mvcc_transactions_.erase(tx_id);
   return MvccCommitResult{replicated && result.success, false, result.version};
 }
@@ -283,6 +360,10 @@ RequestVoteResponse RaftNode::HandleRequestVote(const RequestVoteRequest& reques
     BecomeFollower(request.term);
   }
 
+  if (!IsVotingMemberLocked(id_) || !IsVotingMemberLocked(request.candidate_id)) {
+    return RequestVoteResponse{current_term_, false};
+  }
+
   const bool can_vote = voted_for_ == -1 || voted_for_ == request.candidate_id;
   const bool up_to_date = IsCandidateLogUpToDate(request.last_log_index, request.last_log_term);
 
@@ -300,6 +381,10 @@ RequestVoteResponse RaftNode::HandlePreVote(const RequestVoteRequest& request) {
   std::lock_guard<std::mutex> lock(mutex_);
   ++metrics_.pre_vote_rpcs;
   if (request.term <= current_term_) {
+    return RequestVoteResponse{current_term_, false};
+  }
+
+  if (!IsVotingMemberLocked(id_) || !IsVotingMemberLocked(request.candidate_id)) {
     return RequestVoteResponse{current_term_, false};
   }
 
@@ -324,6 +409,7 @@ AppendEntriesResponse RaftNode::HandleAppendEntries(const AppendEntriesRequest& 
     BecomeFollower(request.term, request.leader_id);
   } else {
     leader_id_ = request.leader_id;
+    ++leader_contact_sequence_;
     ResetElectionTimer();
   }
 
@@ -363,11 +449,9 @@ AppendEntriesResponse RaftNode::HandleAppendEntries(const AppendEntriesRequest& 
   bool changed = false;
   for (std::size_t i = 0; i < request.entries.size(); ++i) {
     const int global_index = insert_index + static_cast<int>(i);
-    if (HasLogIndex(global_index)) {
-      if (TermAt(global_index) != request.entries[i].term) {
-        log_.resize(ToLocalIndex(global_index));
-        changed = true;
-      }
+    if (HasLogIndex(global_index) && TermAt(global_index) != request.entries[i].term) {
+      log_.resize(ToLocalIndex(global_index));
+      changed = true;
     }
 
     if (!HasLogIndex(global_index)) {
@@ -378,12 +462,15 @@ AppendEntriesResponse RaftNode::HandleAppendEntries(const AppendEntriesRequest& 
 
   if (changed) {
     PersistState();
+    RebuildMembershipStateLocked();
   }
 
   if (request.leader_commit > commit_index_) {
     commit_index_ = std::min(request.leader_commit, LastLogIndex());
     ApplyCommittedEntries();
     MaybeTakeSnapshot();
+    MaybeStepDownIfRemovedLocked();
+    state_condition_.notify_all();
   }
 
   return AppendEntriesResponse{
@@ -406,6 +493,7 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
     BecomeFollower(request.term, request.leader_id);
   } else {
     leader_id_ = request.leader_id;
+    ++leader_contact_sequence_;
     ResetElectionTimer();
   }
 
@@ -416,18 +504,11 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
   snapshot_state_.last_included_index = request.last_included_index;
   snapshot_state_.last_included_term = request.last_included_term;
   snapshot_state_.data = request.state;
+  snapshot_state_.voters = NormalizeVoters(request.voters);
+  snapshot_state_.next_voters = NormalizeVoters(request.next_voters);
+  snapshot_state_.joint = request.joint && !snapshot_state_.next_voters.empty();
   snapshot_state_.peers = request.peers;
   store_->ReplaceWith(snapshot_state_.data);
-  for (const auto& peer : transport_->ListPeers()) {
-    transport_->RemovePeer(peer.id);
-  }
-  peers_.clear();
-  for (const auto& peer : snapshot_state_.peers) {
-    if (peer.id != id_) {
-      peers_.push_back(peer.id);
-      transport_->UpsertPeer(peer);
-    }
-  }
 
   if (LastLogIndex() > request.last_included_index) {
     std::vector<LogEntry> new_log;
@@ -451,6 +532,9 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
     persistence_->SaveSnapshot(snapshot_state_);
   }
   PersistState();
+  RebuildMembershipStateLocked();
+  MaybeStepDownIfRemovedLocked();
+  state_condition_.notify_all();
 
   return InstallSnapshotResponse{current_term_, true, snapshot_state_.last_included_index};
 }
@@ -479,6 +563,11 @@ Role RaftNode::role() const {
   return role_;
 }
 
+bool RaftNode::IsVotingMember() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return IsVotingMemberLocked(id_);
+}
+
 const std::vector<LogEntry>& RaftNode::log() const {
   return log_;
 }
@@ -503,11 +592,15 @@ void RaftNode::ForceElectionTimeout() {
 }
 
 bool RaftNode::ReplicateCommand(Command command, const std::string* request_id, CommandResult* result) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return ReplicateCommandLocked(std::move(command), request_id, result);
+  std::unique_lock<std::mutex> lock(mutex_);
+  return ReplicateCommandLocked(lock, std::move(command), request_id, result);
 }
 
-bool RaftNode::ReplicateCommandLocked(Command command, const std::string* request_id, CommandResult* result) {
+bool RaftNode::ReplicateCommandLocked(
+    std::unique_lock<std::mutex>& lock,
+    Command command,
+    const std::string* request_id,
+    CommandResult* result) {
   if (role_ != Role::Leader) {
     return false;
   }
@@ -543,22 +636,41 @@ bool RaftNode::ReplicateCommandLocked(Command command, const std::string* reques
       break;
   }
 
+  return AppendEntryAndCommitLocked(lock, std::move(command), request_id, result);
+}
+
+bool RaftNode::AppendEntryAndCommitLocked(
+    std::unique_lock<std::mutex>& lock,
+    Command command,
+    const std::string* request_id,
+    CommandResult* result) {
   const std::string effective_request_id = request_id != nullptr ? *request_id : command.request_id;
+  const int request_term = current_term_;
   const int target_index = LastLogIndex() + 1;
   log_.push_back(LogEntry{current_term_, std::move(command)});
   PersistState();
+  RebuildMembershipStateLocked();
   match_index_[id_] = LastLogIndex();
   next_index_[id_] = LastLogIndex() + 1;
-
-  const auto peers = peers_;
+  AdvanceCommitIndex();
+  auto peers = ActiveRemotePeerIdsLocked();
+  lock.unlock();
   for (int peer_id : peers) {
     ReplicateToPeer(peer_id);
   }
+  lock.lock();
 
-  AdvanceCommitIndex();
-  SendHeartbeats();
-  if (commit_index_ != target_index) {
+  if (commit_index_ < target_index) {
     return false;
+  }
+
+  if (role_ == Role::Leader && current_term_ == request_term) {
+    peers = ActiveRemotePeerIdsLocked();
+    lock.unlock();
+    for (int peer_id : peers) {
+      ReplicateToPeer(peer_id);
+    }
+    lock.lock();
   }
 
   if (result != nullptr) {
@@ -603,63 +715,121 @@ std::string RaftNode::NextRequestId(const std::string& prefix) {
 }
 
 void RaftNode::StartPreVote() {
-  ResetElectionTimer();
+  RequestVoteRequest request;
+  MembershipConfig config;
+  std::vector<int> peers;
+  int base_term = 0;
+  std::uint64_t leader_contact_sequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsVotingMemberLocked(id_) || HasRecentLeaderContactLocked()) {
+      return;
+    }
+    base_term = current_term_;
+    leader_contact_sequence = leader_contact_sequence_;
+    ResetElectionTimer();
+    request = RequestVoteRequest{
+        current_term_ + 1,
+        id_,
+        LastLogIndex(),
+        LastLogTerm(),
+    };
+    config = ConfigAtIndexLocked(LastLogIndex());
+    peers = ActiveRemotePeerIdsLocked();
+  }
 
-  RequestVoteRequest request{
-      current_term_ + 1,
-      id_,
-      LastLogIndex(),
-      LastLogTerm(),
-  };
-
-  int votes_granted = 1;
-  const auto peers = peers_;
+  std::vector<int> votes_granted{id_};
   for (int peer_id : peers) {
     auto response = transport_->SendPreVote(peer_id, request);
+    std::lock_guard<std::mutex> lock(mutex_);
     if (response.term > current_term_) {
       BecomeFollower(response.term);
       return;
     }
+    if (current_term_ != base_term || role_ == Role::Leader || leader_contact_sequence_ != leader_contact_sequence) {
+      return;
+    }
     if (response.vote_granted) {
-      ++votes_granted;
+      votes_granted.push_back(peer_id);
     }
   }
 
-  if (votes_granted >= Majority()) {
+  bool should_start_election = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    should_start_election =
+        current_term_ == base_term &&
+        role_ != Role::Leader &&
+        leader_contact_sequence_ == leader_contact_sequence &&
+        HasVoteQuorumLocked(votes_granted, config);
+  }
+  if (should_start_election) {
     StartElection();
   }
 }
 
 void RaftNode::StartElection() {
-  role_ = Role::Candidate;
-  ++current_term_;
-  voted_for_ = id_;
-  leader_id_ = -1;
-  votes_received_ = 1;
-  PersistState();
-  ResetElectionTimer();
+  RequestVoteRequest request;
+  MembershipConfig config;
+  std::vector<int> peers;
+  int election_term = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsVotingMemberLocked(id_)) {
+      return;
+    }
+    role_ = Role::Candidate;
+    ++current_term_;
+    voted_for_ = id_;
+    leader_id_ = -1;
+    votes_received_ = 1;
+    PersistState();
+    ResetElectionTimer();
+    state_condition_.notify_all();
 
-  RequestVoteRequest request{
-      current_term_,
-      id_,
-      LastLogIndex(),
-      LastLogTerm(),
-  };
+    election_term = current_term_;
+    request = RequestVoteRequest{
+        current_term_,
+        id_,
+        LastLogIndex(),
+        LastLogTerm(),
+    };
+    config = ConfigAtIndexLocked(LastLogIndex());
+    peers = ActiveRemotePeerIdsLocked();
+  }
 
-  const auto peers = peers_;
+  std::vector<int> votes_granted{id_};
   for (int peer_id : peers) {
     auto response = transport_->SendRequestVote(peer_id, request);
+    std::lock_guard<std::mutex> lock(mutex_);
     if (response.term > current_term_) {
       BecomeFollower(response.term);
       return;
     }
+    if (current_term_ != election_term || role_ != Role::Candidate) {
+      return;
+    }
     if (response.vote_granted) {
+      votes_granted.push_back(peer_id);
       ++votes_received_;
     }
   }
 
-  if (votes_received_ >= Majority()) {
-    BecomeLeader();
+  bool became_leader = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (current_term_ == election_term &&
+        role_ == Role::Candidate &&
+        HasVoteQuorumLocked(votes_granted, config)) {
+      BecomeLeader();
+      became_leader = true;
+    }
+  }
+
+  if (became_leader) {
+    for (int peer_id : peers) {
+      ReplicateToPeer(peer_id);
+    }
   }
 }
 
@@ -668,28 +838,33 @@ void RaftNode::BecomeFollower(int new_term, int new_leader) {
   current_term_ = new_term;
   voted_for_ = -1;
   leader_id_ = new_leader;
+  if (new_leader != -1) {
+    ++leader_contact_sequence_;
+  }
   votes_received_ = 0;
   heartbeat_elapsed_ = 0;
   PersistState();
   ResetElectionTimer();
+  state_condition_.notify_all();
 }
 
 void RaftNode::BecomeLeader() {
+  if (!IsVotingMemberLocked(id_)) {
+    return;
+  }
+
   role_ = Role::Leader;
   leader_id_ = id_;
   heartbeat_elapsed_ = 0;
   log_.push_back(LogEntry{current_term_, Command{CommandType::Noop, "", "", {}}});
   PersistState();
+  RebuildMembershipStateLocked();
 
-  for (int peer_id : peers_) {
-    next_index_[peer_id] = LastLogIndex() + 1;
-    match_index_[peer_id] = log_base_index_;
-  }
   match_index_[id_] = LastLogIndex();
   next_index_[id_] = LastLogIndex() + 1;
 
   AdvanceCommitIndex();
-  SendHeartbeats();
+  state_condition_.notify_all();
 }
 
 void RaftNode::ResetElectionTimer() {
@@ -701,95 +876,136 @@ void RaftNode::ResetElectionTimer() {
 }
 
 void RaftNode::SendHeartbeats() {
-  const auto peers = peers_;
+  std::vector<int> peers;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (role_ != Role::Leader) {
+      return;
+    }
+    peers = ActiveRemotePeerIdsLocked();
+  }
+
   for (int peer_id : peers) {
     ReplicateToPeer(peer_id);
   }
 }
 
 bool RaftNode::ReplicateToPeer(int peer_id) {
-  if (role_ != Role::Leader) {
-    return false;
-  }
+  while (true) {
+    bool send_snapshot = false;
+    int request_term = 0;
+    int expected_next_index = 0;
+    AppendEntriesRequest append_request;
+    InstallSnapshotRequest snapshot_request;
 
-  if (next_index_[peer_id] <= snapshot_state_.last_included_index) {
-    return SendSnapshotToPeer(peer_id);
-  }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (role_ != Role::Leader || !ContainsId(ActiveRemotePeerIdsLocked(), peer_id)) {
+        return false;
+      }
 
-  const int next_index = next_index_[peer_id];
-  const int prev_log_index = next_index - 1;
-  const int prev_log_term = TermAt(prev_log_index);
+      auto next_it = next_index_.find(peer_id);
+      if (next_it == next_index_.end()) {
+        next_index_[peer_id] = LastLogIndex() + 1;
+        match_index_[peer_id] = 0;
+        next_it = next_index_.find(peer_id);
+      }
 
-  std::vector<LogEntry> entries;
-  for (int index = next_index; index <= LastLogIndex(); ++index) {
-    entries.push_back(log_[ToLocalIndex(index)]);
-  }
+      request_term = current_term_;
+      expected_next_index = next_it->second;
+      if (snapshot_state_.last_included_index > 0 &&
+          next_it->second <= snapshot_state_.last_included_index) {
+        send_snapshot = true;
+        snapshot_request = InstallSnapshotRequest{
+            current_term_,
+            id_,
+            snapshot_state_.last_included_index,
+            snapshot_state_.last_included_term,
+            snapshot_state_.data,
+            snapshot_state_.voters,
+            snapshot_state_.next_voters,
+            snapshot_state_.joint,
+            snapshot_state_.peers,
+        };
+      } else {
+        const int prev_log_index = next_it->second - 1;
+        std::vector<LogEntry> entries;
+        for (int index = next_it->second; index <= LastLogIndex(); ++index) {
+          entries.push_back(log_[ToLocalIndex(index)]);
+        }
+        append_request = AppendEntriesRequest{
+            current_term_,
+            id_,
+            prev_log_index,
+            TermAt(prev_log_index),
+            commit_index_,
+            std::move(entries),
+        };
+      }
+    }
 
-  AppendEntriesRequest request{
-      current_term_,
-      id_,
-      prev_log_index,
-      prev_log_term,
-      commit_index_,
-      entries,
-  };
+    if (send_snapshot) {
+      auto response = transport_->SendInstallSnapshot(peer_id, snapshot_request);
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (response.term > current_term_) {
+        BecomeFollower(response.term);
+        return false;
+      }
+      if (role_ != Role::Leader ||
+          current_term_ != request_term ||
+          !ContainsId(ActiveRemotePeerIdsLocked(), peer_id)) {
+        return false;
+      }
+      if (response.success) {
+        match_index_[peer_id] = response.last_included_index;
+        next_index_[peer_id] = response.last_included_index + 1;
+        AdvanceCommitIndex();
+        state_condition_.notify_all();
+        return true;
+      }
+      return false;
+    }
 
-  auto response = transport_->SendAppendEntries(peer_id, request);
-  if (response.term > current_term_) {
-    BecomeFollower(response.term);
-    return false;
-  }
+    auto response = transport_->SendAppendEntries(peer_id, append_request);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (response.term > current_term_) {
+      BecomeFollower(response.term);
+      return false;
+    }
+    if (role_ != Role::Leader ||
+        current_term_ != request_term ||
+        !ContainsId(ActiveRemotePeerIdsLocked(), peer_id)) {
+      return false;
+    }
 
-  if (response.success) {
-    match_index_[peer_id] = response.match_index;
-    next_index_[peer_id] = response.match_index + 1;
-    AdvanceCommitIndex();
-    return true;
-  } else {
+    if (response.success) {
+      match_index_[peer_id] = std::max(match_index_[peer_id], response.match_index);
+      next_index_[peer_id] = std::max(next_index_[peer_id], response.match_index + 1);
+      AdvanceCommitIndex();
+      state_condition_.notify_all();
+      return true;
+    }
+
     if (response.conflict_index <= 0 && response.conflict_term < 0) {
       return false;
     }
 
-    int next_index = response.conflict_index;
+    int next_retry_index = response.conflict_index;
     if (response.conflict_term >= 0) {
       const int local_conflict_index = FindLastIndexOfTerm(response.conflict_term);
-      next_index = local_conflict_index >= response.conflict_index
+      next_retry_index = local_conflict_index >= response.conflict_index
           ? local_conflict_index + 1
           : response.conflict_index;
     }
-    if (next_index <= 0 || next_index >= next_index_[peer_id]) {
-      next_index = std::max(snapshot_state_.last_included_index + 1, next_index_[peer_id] - 1);
+    if (next_retry_index <= 0 || next_retry_index >= expected_next_index) {
+      next_retry_index = std::max(log_base_index_ + 1, expected_next_index - 1);
     }
-    next_index_[peer_id] = next_index;
-
-    if (next_index_[peer_id] <= snapshot_state_.last_included_index) {
-      return SendSnapshotToPeer(peer_id);
-    }
-    return ReplicateToPeer(peer_id);
+    next_index_[peer_id] = next_retry_index;
   }
 }
 
 bool RaftNode::SendSnapshotToPeer(int peer_id) {
-  InstallSnapshotRequest request{
-      current_term_,
-      id_,
-      snapshot_state_.last_included_index,
-      snapshot_state_.last_included_term,
-      snapshot_state_.data,
-      snapshot_state_.peers,
-  };
-
-  auto response = transport_->SendInstallSnapshot(peer_id, request);
-  if (response.term > current_term_) {
-    BecomeFollower(response.term);
-    return false;
-  }
-  if (response.success) {
-    match_index_[peer_id] = response.last_included_index;
-    next_index_[peer_id] = response.last_included_index + 1;
-    return true;
-  }
-  return false;
+  return ReplicateToPeer(peer_id);
 }
 
 void RaftNode::AdvanceCommitIndex() {
@@ -798,19 +1014,14 @@ void RaftNode::AdvanceCommitIndex() {
       continue;
     }
 
-    int replicated = 1;
-    for (int peer_id : peers_) {
-      auto it = match_index_.find(peer_id);
-      if (it != match_index_.end() && it->second >= candidate) {
-        ++replicated;
-      }
-    }
-
-    if (replicated >= Majority()) {
+    const MembershipConfig config = ConfigAtIndexLocked(candidate);
+    if (HasCommitQuorumLocked(candidate, config)) {
       metrics_.committed_entries += static_cast<std::uint64_t>(candidate - commit_index_);
       commit_index_ = candidate;
       ApplyCommittedEntries();
       MaybeTakeSnapshot();
+      MaybeStepDownIfRemovedLocked();
+      state_condition_.notify_all();
       return;
     }
   }
@@ -828,32 +1039,14 @@ void RaftNode::ApplyCommittedEntries() {
 void RaftNode::ApplyCommand(const Command& command) {
   switch (command.type) {
     case CommandType::Noop:
+    case CommandType::AddPeer:
+    case CommandType::RemovePeer:
+    case CommandType::BeginJointConfig:
+    case CommandType::FinalizeConfig:
       break;
     case CommandType::Put:
       store_->Put(command.key, command.value);
       break;
-    case CommandType::AddPeer: {
-      if (command.peer.id == id_) {
-        break;
-      }
-      const bool exists = std::find(peers_.begin(), peers_.end(), command.peer.id) != peers_.end();
-      if (!exists) {
-        peers_.push_back(command.peer.id);
-      }
-      transport_->UpsertPeer(command.peer);
-      if (role_ == Role::Leader) {
-        next_index_[command.peer.id] = LastLogIndex() + 1;
-        match_index_[command.peer.id] = snapshot_state_.last_included_index;
-      }
-      break;
-    }
-    case CommandType::RemovePeer: {
-      peers_.erase(std::remove(peers_.begin(), peers_.end(), command.peer.id), peers_.end());
-      transport_->RemovePeer(command.peer.id);
-      next_index_.erase(command.peer.id);
-      match_index_.erase(command.peer.id);
-      break;
-    }
     case CommandType::AcquireLock: {
       const auto current_owner = LockOwnerUnlocked(command.key);
       const bool acquired = !current_owner.has_value() || *current_owner == command.value;
@@ -886,15 +1079,292 @@ void RaftNode::ApplyCommand(const Command& command) {
   }
 }
 
+void RaftNode::RebuildMembershipStateLocked() {
+  MembershipConfig config = BaseConfigLocked();
+  std::unordered_map<int, PeerEndpoint> endpoints;
+
+  const auto seed_peers = snapshot_state_.last_included_index > 0 ? snapshot_state_.peers : transport_->ListPeers();
+  for (const auto& peer : seed_peers) {
+    if (peer.id != id_) {
+      endpoints[peer.id] = peer;
+    }
+  }
+
+  for (int index = log_base_index_ + 1; index <= LastLogIndex(); ++index) {
+    ApplyConfigCommandLocked(log_[ToLocalIndex(index)].command, config, &endpoints);
+  }
+
+  config_voters_ = NormalizeVoters(std::move(config.voters));
+  config_next_voters_ = NormalizeVoters(std::move(config.next_voters));
+  config_joint_ = config.joint && !config_next_voters_.empty();
+  peer_endpoints_ = std::move(endpoints);
+  RefreshTransportPeersLocked();
+  RefreshReplicationTrackingLocked();
+}
+
+void RaftNode::RefreshTransportPeersLocked() {
+  const auto active_peers = ActiveRemotePeerIdsLocked();
+  for (const auto& peer : transport_->ListPeers()) {
+    if (!ContainsId(active_peers, peer.id)) {
+      transport_->RemovePeer(peer.id);
+    }
+  }
+
+  for (int peer_id : active_peers) {
+    auto it = peer_endpoints_.find(peer_id);
+    if (it == peer_endpoints_.end()) {
+      it = peer_endpoints_.emplace(peer_id, PeerEndpoint{peer_id, "127.0.0.1", 0, 0}).first;
+    }
+    transport_->UpsertPeer(it->second);
+  }
+}
+
+void RaftNode::RefreshReplicationTrackingLocked() {
+  const auto active_peers = ActiveRemotePeerIdsLocked();
+
+  for (auto it = next_index_.begin(); it != next_index_.end();) {
+    if (it->first != id_ && !ContainsId(active_peers, it->first)) {
+      it = next_index_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = match_index_.begin(); it != match_index_.end();) {
+    if (it->first != id_ && !ContainsId(active_peers, it->first)) {
+      it = match_index_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  match_index_[id_] = LastLogIndex();
+  next_index_[id_] = LastLogIndex() + 1;
+
+  if (role_ != Role::Leader) {
+    return;
+  }
+
+  for (int peer_id : active_peers) {
+    auto& next = next_index_[peer_id];
+    if (next <= 0 || next > LastLogIndex() + 1) {
+      next = LastLogIndex() + 1;
+    }
+    auto& match = match_index_[peer_id];
+    if (match < 0) {
+      match = 0;
+    }
+  }
+}
+
+void RaftNode::MaybeStepDownIfRemovedLocked() {
+  const MembershipConfig committed_config = ConfigAtIndexLocked(commit_index_);
+  if (role_ == Role::Leader && !IsVoterInConfigLocked(committed_config, id_)) {
+    BecomeFollower(current_term_);
+    return;
+  }
+
+  if (role_ == Role::Candidate && !IsVotingMemberLocked(id_)) {
+    role_ = Role::Follower;
+    leader_id_ = -1;
+    votes_received_ = 0;
+    heartbeat_elapsed_ = 0;
+    voted_for_ = -1;
+    PersistState();
+    ResetElectionTimer();
+    state_condition_.notify_all();
+  }
+}
+
+RaftNode::MembershipConfig RaftNode::BaseConfigLocked() const {
+  MembershipConfig config;
+  if (!snapshot_state_.voters.empty()) {
+    config.voters = snapshot_state_.voters;
+    config.next_voters = snapshot_state_.next_voters;
+    config.joint = snapshot_state_.joint && !snapshot_state_.next_voters.empty();
+    return config;
+  }
+
+  config.voters = initial_voters_;
+  return config;
+}
+
+RaftNode::MembershipConfig RaftNode::ConfigAtIndexLocked(int global_index) const {
+  MembershipConfig config = BaseConfigLocked();
+  if (global_index < log_base_index_) {
+    return config;
+  }
+
+  const int capped_index = std::min(global_index, LastLogIndex());
+  for (int index = log_base_index_ + 1; index <= capped_index; ++index) {
+    ApplyConfigCommandLocked(log_[ToLocalIndex(index)].command, config, nullptr);
+  }
+  return config;
+}
+
+bool RaftNode::HasMajorityLocked(const std::vector<int>& acknowledged_ids, const std::vector<int>& voters) const {
+  int matches = 0;
+  for (int voter_id : voters) {
+    if (ContainsId(acknowledged_ids, voter_id)) {
+      ++matches;
+    }
+  }
+  return matches >= static_cast<int>(voters.size() / 2) + 1;
+}
+
+bool RaftNode::HasVoteQuorumLocked(const std::vector<int>& granted_ids, const MembershipConfig& config) const {
+  if (!config.joint) {
+    return HasMajorityLocked(granted_ids, config.voters);
+  }
+  return HasMajorityLocked(granted_ids, config.voters) &&
+      HasMajorityLocked(granted_ids, config.next_voters);
+}
+
+bool RaftNode::HasReadQuorumLocked(const std::vector<int>& responder_ids, const MembershipConfig& config) const {
+  return HasVoteQuorumLocked(responder_ids, config);
+}
+
+bool RaftNode::HasCommitQuorumLocked(int candidate_index, const MembershipConfig& config) const {
+  auto all_voters = config.voters;
+  if (config.joint) {
+    all_voters.insert(all_voters.end(), config.next_voters.begin(), config.next_voters.end());
+    all_voters = NormalizeVoters(std::move(all_voters));
+  }
+
+  std::vector<int> replicated_ids;
+  for (int voter_id : all_voters) {
+    auto it = match_index_.find(voter_id);
+    if (it != match_index_.end() && it->second >= candidate_index) {
+      replicated_ids.push_back(voter_id);
+    }
+  }
+  if (!config.joint) {
+    return HasMajorityLocked(replicated_ids, config.voters);
+  }
+  return HasMajorityLocked(replicated_ids, config.voters) &&
+      HasMajorityLocked(replicated_ids, config.next_voters);
+}
+
+bool RaftNode::IsVoterInConfigLocked(const MembershipConfig& config, int node_id) const {
+  return ContainsId(config.voters, node_id) || (config.joint && ContainsId(config.next_voters, node_id));
+}
+
+bool RaftNode::IsVotingMemberLocked(int node_id) const {
+  MembershipConfig config;
+  config.voters = config_voters_;
+  config.next_voters = config_next_voters_;
+  config.joint = config_joint_;
+  return IsVoterInConfigLocked(config, node_id);
+}
+
+bool RaftNode::HasUncommittedConfigChangeLocked() const {
+  for (int index = commit_index_ + 1; index <= LastLogIndex(); ++index) {
+    if (IsConfigCommandType(log_[ToLocalIndex(index)].command.type)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RaftNode::ApplyConfigCommandLocked(
+    const Command& command,
+    MembershipConfig& config,
+    std::unordered_map<int, PeerEndpoint>* endpoints) const {
+  switch (command.type) {
+    case CommandType::AddPeer:
+      config.voters.push_back(command.peer.id);
+      config.voters = NormalizeVoters(std::move(config.voters));
+      config.next_voters.clear();
+      config.joint = false;
+      if (endpoints != nullptr && command.peer.id != id_) {
+        (*endpoints)[command.peer.id] = command.peer;
+      }
+      return;
+    case CommandType::RemovePeer:
+      config.voters.erase(std::remove(config.voters.begin(), config.voters.end(), command.peer.id), config.voters.end());
+      config.voters = NormalizeVoters(std::move(config.voters));
+      config.next_voters.clear();
+      config.joint = false;
+      return;
+    case CommandType::BeginJointConfig:
+      config.voters = NormalizeVoters(command.config_voters);
+      config.next_voters = NormalizeVoters(command.config_next_voters);
+      config.joint = !config.next_voters.empty();
+      break;
+    case CommandType::FinalizeConfig:
+      config.voters = NormalizeVoters(command.config_voters);
+      config.next_voters.clear();
+      config.joint = false;
+      break;
+    default:
+      return;
+  }
+
+  if (endpoints == nullptr) {
+    return;
+  }
+
+  for (const auto& peer : command.config_peers) {
+    if (peer.id != id_) {
+      (*endpoints)[peer.id] = peer;
+    }
+  }
+}
+
+std::vector<int> RaftNode::NormalizeVoters(std::vector<int> voters) const {
+  voters.erase(std::remove_if(voters.begin(), voters.end(), [](int voter_id) {
+    return voter_id <= 0;
+  }), voters.end());
+  std::sort(voters.begin(), voters.end());
+  voters.erase(std::unique(voters.begin(), voters.end()), voters.end());
+  return voters;
+}
+
+std::vector<int> RaftNode::ActiveRemotePeerIdsLocked() const {
+  auto peers = config_voters_;
+  if (config_joint_) {
+    peers.insert(peers.end(), config_next_voters_.begin(), config_next_voters_.end());
+    peers = NormalizeVoters(std::move(peers));
+  }
+  peers.erase(std::remove(peers.begin(), peers.end(), id_), peers.end());
+  return peers;
+}
+
+std::vector<PeerEndpoint> RaftNode::PeerEndpointsForConfigLocked(const MembershipConfig& config) const {
+  auto voters = config.voters;
+  if (config.joint) {
+    voters.insert(voters.end(), config.next_voters.begin(), config.next_voters.end());
+    voters = NormalizeVoters(std::move(voters));
+  }
+
+  std::vector<PeerEndpoint> peers;
+  peers.reserve(voters.size());
+  for (int voter_id : voters) {
+    if (voter_id == id_) {
+      continue;
+    }
+    auto it = peer_endpoints_.find(voter_id);
+    if (it != peer_endpoints_.end()) {
+      peers.push_back(it->second);
+    } else {
+      peers.push_back(PeerEndpoint{voter_id, "127.0.0.1", 0, 0});
+    }
+  }
+  return peers;
+}
+
 void RaftNode::MaybeTakeSnapshot() {
   if (commit_index_ - snapshot_state_.last_included_index < kSnapshotThreshold) {
     return;
   }
 
+  const MembershipConfig committed_config = ConfigAtIndexLocked(commit_index_);
   snapshot_state_.last_included_index = commit_index_;
   snapshot_state_.last_included_term = TermAt(commit_index_);
   snapshot_state_.data = store_->Entries();
-  snapshot_state_.peers = transport_->ListPeers();
+  snapshot_state_.voters = committed_config.voters;
+  snapshot_state_.next_voters = committed_config.next_voters;
+  snapshot_state_.joint = committed_config.joint;
+  snapshot_state_.peers = PeerEndpointsForConfigLocked(committed_config);
 
   std::vector<LogEntry> new_log;
   new_log.push_back(LogEntry{snapshot_state_.last_included_term, Command{}});
@@ -924,37 +1394,42 @@ void RaftNode::PersistState() {
   });
 }
 
-bool RaftNode::ConfirmLeaderForReadLocked() {
+bool RaftNode::ConfirmLeaderForReadLocked(std::unique_lock<std::mutex>& lock) {
   ++metrics_.linearizable_read_checks;
   if (role_ != Role::Leader) {
     ++metrics_.linearizable_read_failures;
     return false;
   }
 
+  int request_term = current_term_;
   if (!HasCommittedCurrentTermEntry()) {
-    SendHeartbeats();
-    if (role_ != Role::Leader || !HasCommittedCurrentTermEntry()) {
+    const auto peers = ActiveRemotePeerIdsLocked();
+    lock.unlock();
+    for (int peer_id : peers) {
+      ReplicateToPeer(peer_id);
+    }
+    lock.lock();
+
+    if (role_ != Role::Leader || current_term_ != request_term || !HasCommittedCurrentTermEntry()) {
       ++metrics_.linearizable_read_failures;
       return false;
     }
   }
 
-  int confirmations = 1;
-  const auto peers = peers_;
+  request_term = current_term_;
+  const MembershipConfig config = ConfigAtIndexLocked(LastLogIndex());
+  const auto peers = ActiveRemotePeerIdsLocked();
+  lock.unlock();
+
+  std::vector<int> responders{id_};
   for (int peer_id : peers) {
     if (ReplicateToPeer(peer_id)) {
-      ++confirmations;
-      if (confirmations >= Majority()) {
-        break;
-      }
-    }
-    if (role_ != Role::Leader) {
-      ++metrics_.linearizable_read_failures;
-      return false;
+      responders.push_back(peer_id);
     }
   }
 
-  if (confirmations < Majority()) {
+  lock.lock();
+  if (role_ != Role::Leader || current_term_ != request_term || !HasReadQuorumLocked(responders, config)) {
     ++metrics_.linearizable_read_failures;
     return false;
   }
@@ -1058,8 +1533,4 @@ int RaftNode::LastLogIndex() const {
 
 int RaftNode::LastLogTerm() const {
   return log_.back().term;
-}
-
-int RaftNode::Majority() const {
-  return static_cast<int>((peers_.size() + 1) / 2) + 1;
 }

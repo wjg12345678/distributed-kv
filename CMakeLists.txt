@@ -75,6 +75,14 @@ add_executable(raft_membership_test tests/unit/raft_membership_test.cpp)
 target_link_libraries(raft_membership_test PRIVATE distributed_kv)
 add_test(NAME raft_membership_test COMMAND $<TARGET_FILE:raft_membership_test>)
 
+add_executable(raft_async_replication_test tests/unit/raft_async_replication_test.cpp)
+target_link_libraries(raft_async_replication_test PRIVATE distributed_kv)
+add_test(NAME raft_async_replication_test COMMAND $<TARGET_FILE:raft_async_replication_test>)
+
+add_executable(tcp_util_timeout_test tests/unit/tcp_util_timeout_test.cpp)
+target_link_libraries(tcp_util_timeout_test PRIVATE distributed_kv)
+add_test(NAME tcp_util_timeout_test COMMAND $<TARGET_FILE:tcp_util_timeout_test>)
+
 add_executable(raft_lock_test tests/unit/raft_lock_test.cpp)
 target_link_libraries(raft_lock_test PRIVATE distributed_kv)
 add_test(NAME raft_lock_test COMMAND $<TARGET_FILE:raft_lock_test>)

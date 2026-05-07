@@ -14,9 +14,11 @@ enum CommandType {
   COMMAND_TYPE_PUT = 1;
   COMMAND_TYPE_ADD_PEER = 2;
   COMMAND_TYPE_REMOVE_PEER = 3;
-  COMMAND_TYPE_ACQUIRE_LOCK = 4;
-  COMMAND_TYPE_RELEASE_LOCK = 5;
-  COMMAND_TYPE_MVCC_COMMIT = 6;
+  COMMAND_TYPE_BEGIN_JOINT_CONFIG = 4;
+  COMMAND_TYPE_FINALIZE_CONFIG = 5;
+  COMMAND_TYPE_ACQUIRE_LOCK = 6;
+  COMMAND_TYPE_RELEASE_LOCK = 7;
+  COMMAND_TYPE_MVCC_COMMIT = 8;
 }
 
 message KeyValue {
@@ -32,6 +34,9 @@ message Command {
   string request_id = 5;
   uint64 mvcc_commit_ts = 6;
   repeated KeyValue writes = 7;
+  repeated int32 config_voters = 8;
+  repeated int32 config_next_voters = 9;
+  repeated PeerEndpoint config_peers = 10;
 }
 
 message LogEntry {
@@ -74,7 +79,10 @@ message InstallSnapshotRequest {
   int32 last_included_index = 3;
   int32 last_included_term = 4;
   repeated KeyValue state = 5;
-  repeated PeerEndpoint peers = 6;
+  repeated int32 voters = 6;
+  repeated int32 next_voters = 7;
+  bool joint = 8;
+  repeated PeerEndpoint peers = 9;
 }
 
 message InstallSnapshotResponse {

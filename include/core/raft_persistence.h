@@ -19,6 +19,9 @@ struct SnapshotState {
   int last_included_index = 0;
   int last_included_term = 0;
   std::vector<std::pair<std::string, std::string>> data;
+  std::vector<int> voters;
+  std::vector<int> next_voters;
+  bool joint = false;
   std::vector<PeerEndpoint> peers;
 };
 

@@ -29,6 +29,10 @@ ProtoCommandType ToProtoCommandType(CommandType type) {
       return ProtoCommandType::COMMAND_TYPE_ADD_PEER;
     case CommandType::RemovePeer:
       return ProtoCommandType::COMMAND_TYPE_REMOVE_PEER;
+    case CommandType::BeginJointConfig:
+      return ProtoCommandType::COMMAND_TYPE_BEGIN_JOINT_CONFIG;
+    case CommandType::FinalizeConfig:
+      return ProtoCommandType::COMMAND_TYPE_FINALIZE_CONFIG;
     case CommandType::AcquireLock:
       return ProtoCommandType::COMMAND_TYPE_ACQUIRE_LOCK;
     case CommandType::ReleaseLock:
@@ -49,6 +53,10 @@ CommandType FromProtoCommandType(ProtoCommandType type) {
       return CommandType::AddPeer;
     case ProtoCommandType::COMMAND_TYPE_REMOVE_PEER:
       return CommandType::RemovePeer;
+    case ProtoCommandType::COMMAND_TYPE_BEGIN_JOINT_CONFIG:
+      return CommandType::BeginJointConfig;
+    case ProtoCommandType::COMMAND_TYPE_FINALIZE_CONFIG:
+      return CommandType::FinalizeConfig;
     case ProtoCommandType::COMMAND_TYPE_ACQUIRE_LOCK:
       return CommandType::AcquireLock;
     case ProtoCommandType::COMMAND_TYPE_RELEASE_LOCK:
@@ -96,6 +104,15 @@ ProtoCommand ToProtoCommand(const Command& command) {
   for (const auto& write : command.writes) {
     *message.add_writes() = ToProtoKeyValue(write);
   }
+  for (int voter_id : command.config_voters) {
+    message.add_config_voters(voter_id);
+  }
+  for (int voter_id : command.config_next_voters) {
+    message.add_config_next_voters(voter_id);
+  }
+  for (const auto& peer : command.config_peers) {
+    *message.add_config_peers() = ToProtoPeer(peer);
+  }
   return message;
 }
 
@@ -109,6 +126,15 @@ Command FromProtoCommand(const ProtoCommand& command) {
   native.mvcc_commit_ts = command.mvcc_commit_ts();
   for (const auto& write : command.writes()) {
     native.writes.push_back(FromProtoKeyValue(write));
+  }
+  for (int voter_id : command.config_voters()) {
+    native.config_voters.push_back(voter_id);
+  }
+  for (int voter_id : command.config_next_voters()) {
+    native.config_next_voters.push_back(voter_id);
+  }
+  for (const auto& peer : command.config_peers()) {
+    native.config_peers.push_back(FromProtoPeer(peer));
   }
   return native;
 }
@@ -220,6 +246,13 @@ std::string EncodeInstallSnapshotRequest(const InstallSnapshotRequest& request) 
   for (const auto& item : request.state) {
     *message.add_state() = ToProtoKeyValue(KeyValue{item.first, item.second});
   }
+  for (int voter_id : request.voters) {
+    message.add_voters(voter_id);
+  }
+  for (int voter_id : request.next_voters) {
+    message.add_next_voters(voter_id);
+  }
+  message.set_joint(request.joint);
   for (const auto& peer : request.peers) {
     *message.add_peers() = ToProtoPeer(peer);
   }
@@ -300,6 +333,13 @@ InstallSnapshotRequest DecodeInstallSnapshotRequest(const std::string& payload) 
   for (const auto& item : message.state()) {
     request.state.push_back({item.key(), item.value()});
   }
+  for (int voter_id : message.voters()) {
+    request.voters.push_back(voter_id);
+  }
+  for (int voter_id : message.next_voters()) {
+    request.next_voters.push_back(voter_id);
+  }
+  request.joint = message.joint();
   for (const auto& peer : message.peers()) {
     request.peers.push_back(FromProtoPeer(peer));
   }

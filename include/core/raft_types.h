@@ -23,6 +23,8 @@ enum class CommandType {
   Put,
   AddPeer,
   RemovePeer,
+  BeginJointConfig,
+  FinalizeConfig,
   AcquireLock,
   ReleaseLock,
   MvccCommit,
@@ -41,6 +43,9 @@ struct Command {
   std::string request_id;
   std::uint64_t mvcc_commit_ts = 0;
   std::vector<KeyValue> writes;
+  std::vector<int> config_voters;
+  std::vector<int> config_next_voters;
+  std::vector<PeerEndpoint> config_peers;
 };
 
 struct LogEntry {
@@ -83,6 +88,9 @@ struct InstallSnapshotRequest {
   int last_included_index = 0;
   int last_included_term = 0;
   std::vector<std::pair<std::string, std::string>> state;
+  std::vector<int> voters;
+  std::vector<int> next_voters;
+  bool joint = false;
   std::vector<PeerEndpoint> peers;
 };
 

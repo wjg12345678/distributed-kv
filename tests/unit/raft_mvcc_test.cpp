@@ -1,7 +1,24 @@
 #include "core/cluster.h"
 
 #include <cassert>
+#include <chrono>
 #include <memory>
+#include <thread>
+
+namespace {
+
+template <typename Predicate>
+bool WaitUntil(Predicate&& predicate, int attempts = 100, int sleep_ms = 10) {
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+  }
+  return predicate();
+}
+
+}  // namespace
 
 int main() {
   Cluster cluster;
@@ -61,12 +78,14 @@ int main() {
   for (int id : {1, 2, 3}) {
     auto node = cluster.FindNode(id);
     assert(node);
-    const auto snapshot_v1 = node->ReadMvcc("order", commit1.commit_ts);
-    const auto snapshot_v2 = node->ReadMvcc("order", commit2.commit_ts);
-    assert(snapshot_v1.has_value());
-    assert(snapshot_v2.has_value());
-    assert(*snapshot_v1 == "v1");
-    assert(*snapshot_v2 == "v2");
+    assert(WaitUntil([&]() {
+      const auto snapshot_v1 = node->ReadMvcc("order", commit1.commit_ts);
+      const auto snapshot_v2 = node->ReadMvcc("order", commit2.commit_ts);
+      return snapshot_v1.has_value() &&
+          snapshot_v2.has_value() &&
+          *snapshot_v1 == "v1" &&
+          *snapshot_v2 == "v2";
+    }));
   }
 
   return 0;

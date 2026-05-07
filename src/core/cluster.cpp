@@ -4,6 +4,7 @@
 
 void Cluster::AddNode(const std::shared_ptr<RaftNode>& node) {
   nodes_.push_back(node);
+  peers_[node->id()] = PeerEndpoint{node->id(), "127.0.0.1", 0, 0};
 }
 
 RequestVoteResponse Cluster::SendPreVote(int target_id, const RequestVoteRequest& request) {
@@ -39,15 +40,21 @@ InstallSnapshotResponse Cluster::SendInstallSnapshot(int target_id, const Instal
 }
 
 void Cluster::UpsertPeer(const PeerEndpoint& peer) {
-  (void)peer;
+  peers_[peer.id] = peer;
 }
 
 void Cluster::RemovePeer(int peer_id) {
-  (void)peer_id;
+  peers_.erase(peer_id);
 }
 
 std::vector<PeerEndpoint> Cluster::ListPeers() const {
-  return {};
+  std::vector<PeerEndpoint> peers;
+  peers.reserve(peers_.size());
+  for (const auto& [id, peer] : peers_) {
+    (void)id;
+    peers.push_back(peer);
+  }
+  return peers;
 }
 
 std::shared_ptr<RaftNode> Cluster::FindNode(int id) const {

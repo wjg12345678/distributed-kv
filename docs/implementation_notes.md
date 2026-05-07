@@ -10,9 +10,9 @@
 
 - 完整的 Raft 主链路：Leader 选举、日志复制、冲突回退、当前 Term commit 约束、快照与 InstallSnapshot
 - 一致性边界补充：Pre-Vote 与 ReadIndex 风格线性一致读
-- 多进程网络形态：独立节点进程、TCP + Protobuf 节点通信、HTTP 接口与 Prometheus 风格指标
+- 多进程网络形态：独立节点进程、TCP + Protobuf 节点通信、HTTP 接口与纯文本指标
 - 状态机扩展：KV、分布式锁、MVCC 读写与写写冲突检测
-- 工程配套：`ctest` 回归测试、本地三节点脚本、`wrk` 压测脚本
+- 工程配套：`ctest` 回归测试、多进程 smoke / e2e 脚本、`wrk` 压测脚本
 
 ## 架构速记
 
@@ -74,7 +74,7 @@ MVCC 提供事务开始、基于 `snapshot_ts` 的历史版本读取以及提交
 
 ### 成员变更
 
-当前成员变更通过日志命令完成 add / remove peer，能够覆盖动态扩缩容的基本流程。实现上采用直接配置变更路径，尚未引入 joint consensus。
+当前成员变更通过 `BeginJointConfig` / `FinalizeConfig` 两阶段日志命令完成 add / remove peer，能够覆盖 joint consensus 风格的动态扩缩容主流程。当前运维层仍然依赖脚本完成新节点拉起、端口分配和数据目录准备。
 
 ## 工程范围
 
@@ -85,6 +85,6 @@ MVCC 提供事务开始、基于 `snapshot_ts` 的历史版本读取以及提交
 
 ## 可扩展方向
 
-- 补齐基于 joint consensus 的成员变更路径
+- 补齐更完整的节点 bootstrap / decommission 编排与运维自动化
 - 增加优雅退出、配置文件化和更完整的部署管理能力
 - 引入跨机器压测、故障注入和系统化混沌验证

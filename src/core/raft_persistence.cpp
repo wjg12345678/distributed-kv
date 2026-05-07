@@ -31,6 +31,21 @@ std::string SerializeLogEntries(const std::vector<LogEntry>& entries) {
     for (const auto& write : entry.command.writes) {
       out << '\t' << std::quoted(write.key) << '\t' << std::quoted(write.value);
     }
+    out << '\t' << entry.command.config_voters.size();
+    for (int voter_id : entry.command.config_voters) {
+      out << '\t' << voter_id;
+    }
+    out << '\t' << entry.command.config_next_voters.size();
+    for (int voter_id : entry.command.config_next_voters) {
+      out << '\t' << voter_id;
+    }
+    out << '\t' << entry.command.config_peers.size();
+    for (const auto& peer : entry.command.config_peers) {
+      out << '\t' << peer.id
+          << '\t' << std::quoted(peer.host)
+          << '\t' << peer.raft_port
+          << '\t' << peer.http_port;
+    }
     out << '\n';
   }
   return out.str();
@@ -65,10 +80,60 @@ std::vector<LogEntry> DeserializeLogEntries(const std::string& payload) {
       in >> std::quoted(write.key) >> std::quoted(write.value);
       entry.command.writes.push_back(write);
     }
+    std::size_t voter_count = 0;
+    in >> voter_count;
+    for (std::size_t j = 0; j < voter_count; ++j) {
+      int voter_id = 0;
+      in >> voter_id;
+      entry.command.config_voters.push_back(voter_id);
+    }
+    std::size_t next_voter_count = 0;
+    in >> next_voter_count;
+    for (std::size_t j = 0; j < next_voter_count; ++j) {
+      int voter_id = 0;
+      in >> voter_id;
+      entry.command.config_next_voters.push_back(voter_id);
+    }
+    std::size_t peer_count = 0;
+    in >> peer_count;
+    for (std::size_t j = 0; j < peer_count; ++j) {
+      PeerEndpoint peer;
+      in >> peer.id
+         >> std::quoted(peer.host)
+         >> peer.raft_port
+         >> peer.http_port;
+      entry.command.config_peers.push_back(peer);
+    }
     in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     entries.push_back(entry);
   }
   return entries;
+}
+
+std::string SerializeVoters(const std::vector<int>& voters) {
+  std::ostringstream out;
+  out << voters.size() << '\n';
+  for (int voter_id : voters) {
+    out << voter_id << '\n';
+  }
+  return out.str();
+}
+
+std::vector<int> DeserializeVoters(const std::string& payload) {
+  std::istringstream in(payload);
+  std::size_t size = 0;
+  in >> size;
+  in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+  std::vector<int> voters;
+  voters.reserve(size);
+  for (std::size_t i = 0; i < size; ++i) {
+    int voter_id = 0;
+    in >> voter_id;
+    in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    voters.push_back(voter_id);
+  }
+  return voters;
 }
 
 std::string SerializeSnapshotEntries(const std::vector<std::pair<std::string, std::string>>& entries) {
@@ -230,6 +295,9 @@ void RocksDbRaftPersistence::SaveSnapshot(const SnapshotState& snapshot) {
   batch.Put("snapshot/last_included_index", IntToString(snapshot.last_included_index));
   batch.Put("snapshot/last_included_term", IntToString(snapshot.last_included_term));
   batch.Put("snapshot/data", SerializeSnapshotEntries(snapshot.data));
+  batch.Put("snapshot/voters", SerializeVoters(snapshot.voters));
+  batch.Put("snapshot/next_voters", SerializeVoters(snapshot.next_voters));
+  batch.Put("snapshot/joint", snapshot.joint ? "1" : "0");
   batch.Put("snapshot/peers", SerializePeers(snapshot.peers));
 
   auto status = impl_->db_->Write(rocksdb::WriteOptions(), &batch);
@@ -250,6 +318,9 @@ bool RocksDbRaftPersistence::LoadSnapshot(SnapshotState& snapshot) {
 
   std::string term;
   std::string data;
+  std::string voters;
+  std::string next_voters;
+  std::string joint;
   std::string peers;
   auto read = [&](const std::string& key, std::string& value) {
     auto s = impl_->db_->Get(rocksdb::ReadOptions(), key, &value);
@@ -260,11 +331,17 @@ bool RocksDbRaftPersistence::LoadSnapshot(SnapshotState& snapshot) {
 
   read("snapshot/last_included_term", term);
   read("snapshot/data", data);
+  read("snapshot/voters", voters);
+  read("snapshot/next_voters", next_voters);
+  read("snapshot/joint", joint);
   read("snapshot/peers", peers);
 
   snapshot.last_included_index = StringToInt(index);
   snapshot.last_included_term = StringToInt(term);
   snapshot.data = DeserializeSnapshotEntries(data);
+  snapshot.voters = DeserializeVoters(voters);
+  snapshot.next_voters = DeserializeVoters(next_voters);
+  snapshot.joint = joint == "1";
   snapshot.peers = DeserializePeers(peers);
   return true;
 }

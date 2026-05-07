@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 class Cluster : public IRaftTransport {
@@ -25,4 +26,5 @@ public:
 
 private:
   std::vector<std::shared_ptr<RaftNode>> nodes_;
+  std::unordered_map<int, PeerEndpoint> peers_;
 };

@@ -1,9 +1,12 @@
 #include "network/tcp_util.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -13,11 +16,74 @@
 
 namespace {
 
+bool WaitForSocketEvent(int fd, short events, int timeout_ms) {
+  pollfd pfd{};
+  pfd.fd = fd;
+  pfd.events = events;
+
+  while (true) {
+    const int rc = ::poll(&pfd, 1, timeout_ms);
+    if (rc > 0) {
+      return true;
+    }
+    if (rc == 0) {
+      return false;
+    }
+    if (errno != EINTR) {
+      return false;
+    }
+  }
+}
+
+bool SetSocketTimeouts(int fd, int timeout_ms) {
+  timeval timeout{};
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  return ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+      ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0;
+}
+
+bool ConnectWithTimeout(int fd, const sockaddr* address, socklen_t address_length, int timeout_ms) {
+  const int original_flags = ::fcntl(fd, F_GETFL, 0);
+  if (original_flags < 0) {
+    return false;
+  }
+  if (::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
+    return false;
+  }
+
+  const int rc = ::connect(fd, address, address_length);
+  if (rc == 0) {
+    return ::fcntl(fd, F_SETFL, original_flags) == 0 && SetSocketTimeouts(fd, timeout_ms);
+  }
+  if (errno != EINPROGRESS) {
+    ::fcntl(fd, F_SETFL, original_flags);
+    return false;
+  }
+
+  if (!WaitForSocketEvent(fd, POLLOUT, timeout_ms)) {
+    ::fcntl(fd, F_SETFL, original_flags);
+    return false;
+  }
+
+  int socket_error = 0;
+  socklen_t error_length = sizeof(socket_error);
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_length) != 0 || socket_error != 0) {
+    ::fcntl(fd, F_SETFL, original_flags);
+    return false;
+  }
+
+  return ::fcntl(fd, F_SETFL, original_flags) == 0 && SetSocketTimeouts(fd, timeout_ms);
+}
+
 bool ReadAll(int fd, void* buffer, std::size_t length) {
   auto* bytes = static_cast<char*>(buffer);
   std::size_t offset = 0;
   while (offset < length) {
     const ssize_t read_size = ::recv(fd, bytes + offset, length - offset, 0);
+    if (read_size < 0 && errno == EINTR) {
+      continue;
+    }
     if (read_size <= 0) {
       return false;
     }
@@ -31,6 +97,9 @@ bool WriteAll(int fd, const void* buffer, std::size_t length) {
   std::size_t offset = 0;
   while (offset < length) {
     const ssize_t wrote = ::send(fd, bytes + offset, length - offset, 0);
+    if (wrote < 0 && errno == EINTR) {
+      continue;
+    }
     if (wrote <= 0) {
       return false;
     }
@@ -86,7 +155,12 @@ bool WriteFrame(int fd, const std::string& payload) {
          WriteAll(fd, payload.data(), payload.size());
 }
 
-bool RoundTripTcp(const std::string& host, int port, const std::string& request, std::string& response) {
+bool RoundTripTcp(
+    const std::string& host,
+    int port,
+    const std::string& request,
+    std::string& response,
+    int timeout_ms) {
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
@@ -103,7 +177,7 @@ bool RoundTripTcp(const std::string& host, int port, const std::string& request,
     if (fd < 0) {
       continue;
     }
-    if (::connect(fd, addr->ai_addr, addr->ai_addrlen) == 0) {
+    if (ConnectWithTimeout(fd, addr->ai_addr, addr->ai_addrlen, timeout_ms)) {
       connected = true;
       break;
     }
