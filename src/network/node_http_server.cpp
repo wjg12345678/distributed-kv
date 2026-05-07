@@ -1,14 +1,12 @@
 #include "network/node_http_server.h"
 
-#include "network/tcp_util.h"
+#include "network/libuv_http_server.h"
 
 #include <algorithm>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <charconv>
-#include <optional>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,20 +19,6 @@ class BadRequestError : public std::runtime_error {
 public:
   explicit BadRequestError(const std::string& message) : std::runtime_error(message) {}
 };
-
-std::optional<std::string> ExtractHeaderValue(const std::string& request, const std::string& header_name) {
-  const std::string pattern = header_name + ": ";
-  auto start = request.find(pattern);
-  if (start == std::string::npos) {
-    return std::nullopt;
-  }
-  start += pattern.size();
-  auto end = request.find("\r\n", start);
-  if (end == std::string::npos) {
-    return std::nullopt;
-  }
-  return request.substr(start, end - start);
-}
 
 int HexValue(char ch) {
   if (ch >= '0' && ch <= '9') {
@@ -145,132 +129,91 @@ NodeHttpServer::NodeHttpServer(
     std::vector<PeerEndpoint> peers,
     int port,
     std::size_t worker_count)
-    : node_(std::move(node)), peers_(std::move(peers)), port_(port), executor_(worker_count) {}
+    : node_(std::move(node)), peers_(std::move(peers)), port_(port), worker_count_(worker_count) {}
 
 void NodeHttpServer::Run() {
-  const int server_fd = CreateListenSocket(port_);
-  while (true) {
-    const int client_fd = ::accept(server_fd, nullptr, nullptr);
-    if (client_fd < 0) {
-      continue;
-    }
-
-    executor_.Submit([this, client_fd]() {
-      HandleClient(client_fd);
-    });
-  }
+  LibuvHttpServer server(
+      port_,
+      [this](const HttpRequest& request) {
+        return HandleRequest(request);
+      },
+      worker_count_);
+  server.Run();
 }
 
-void NodeHttpServer::HandleClient(int client_fd) {
-  std::string response;
-  try {
-    std::string request;
-    char buffer[4096];
-    ssize_t bytes = 0;
-    while ((bytes = ::recv(client_fd, buffer, sizeof(buffer), 0)) > 0) {
-      request.append(buffer, static_cast<std::size_t>(bytes));
-      auto header_end = request.find("\r\n\r\n");
-      if (header_end != std::string::npos) {
-        std::size_t expected_body = 0;
-        if (auto content_length = ExtractHeaderValue(request, "Content-Length")) {
-          expected_body = ParseIntegerOrThrow<std::size_t>(*content_length, "Content-Length");
-        }
-        if (request.size() >= header_end + 4 + expected_body) {
-          break;
-        }
-      }
-    }
-    response = HandleRequest(request);
-  } catch (const BadRequestError& ex) {
-    response = Response(400, "Bad Request", ex.what());
-  } catch (const std::exception&) {
-    response = Response(500, "Internal Server Error", "internal server error");
-  }
-
-  ::send(client_fd, response.data(), response.size(), 0);
-  ::close(client_fd);
-}
-
-std::string NodeHttpServer::HandleRequest(const std::string& request) {
+HttpResponse NodeHttpServer::HandleRequest(const HttpRequest& request) {
   ++http_requests_total_;
 
-  const auto line_end = request.find("\r\n");
-  if (line_end == std::string::npos) {
-    return Response(400, "Bad Request", "malformed request");
-  }
+  try {
+    const auto [path, query] = SplitPathAndQuery(request.target);
 
-  std::istringstream line_stream(request.substr(0, line_end));
-  std::string method;
-  std::string raw_path;
-  std::string version;
-  line_stream >> method >> raw_path >> version;
-
-  const auto [path, query] = SplitPathAndQuery(raw_path);
-  const auto body_start = request.find("\r\n\r\n");
-  const std::string body = body_start == std::string::npos ? "" : request.substr(body_start + 4);
-
-  if (path == "/status") {
-    return Response(200, "OK", HandleStatus());
-  }
-  if (path == "/metrics") {
-    return Response(200, "OK", HandleMetrics());
-  }
-  if (path == "/admin/add-peer" && method == "POST") {
-    return HandleAddPeer(body);
-  }
-  if (path == "/admin/remove-peer" && method == "POST") {
-    return HandleRemovePeer(body);
-  }
-  if (path == "/lock/acquire" && method == "POST") {
-    return HandleLockAcquire(body);
-  }
-  if (path == "/lock/release" && method == "POST") {
-    return HandleLockRelease(body);
-  }
-  if (path.rfind("/lock/", 0) == 0 && method == "GET") {
-    return HandleLockGet(UrlDecode(path.substr(6)));
-  }
-  if (path == "/mvcc/begin" && method == "POST") {
-    return HandleMvccBegin();
-  }
-  if (path == "/mvcc/commit" && method == "POST") {
-    return HandleMvccCommit(body);
-  }
-  if (path.rfind("/mvcc/tx/", 0) == 0 && method == "PUT") {
-    const std::string prefix = "/mvcc/tx/";
-    const auto tx_key_pos = path.find("/kv/", prefix.size());
-    if (tx_key_pos == std::string::npos) {
-      return Response(400, "Bad Request", "expected /mvcc/tx/<tx_id>/kv/<key>");
+    if (path == "/status") {
+      return Response(200, "OK", HandleStatus());
     }
-    const std::string tx_id = path.substr(prefix.size(), tx_key_pos - prefix.size());
-    const std::string key = UrlDecode(path.substr(tx_key_pos + 4));
-    return HandleMvccWrite(tx_id, key, body);
-  }
-  if (path.rfind("/mvcc/kv/", 0) == 0 && method == "GET") {
-    const auto query_values = query ? ParseQuery(*query) : std::unordered_map<std::string, std::string>{};
-    const auto it = query_values.find("snapshot_ts");
-    return HandleMvccRead(
-        UrlDecode(path.substr(9)),
-        it == query_values.end() ? std::optional<std::string>{} : std::optional<std::string>{it->second});
-  }
-  if (path.rfind("/kv/", 0) == 0) {
-    const std::string key = UrlDecode(path.substr(4));
-    if (method == "GET") {
-      return HandleGet(key);
+    if (path == "/metrics") {
+      return Response(200, "OK", HandleMetrics());
     }
-    if (method == "PUT") {
-      return HandlePut(key, body);
+    if (path == "/admin/add-peer" && request.method == "POST") {
+      return HandleAddPeer(request.body);
     }
-    return Response(405, "Method Not Allowed", "only GET and PUT are supported");
+    if (path == "/admin/remove-peer" && request.method == "POST") {
+      return HandleRemovePeer(request.body);
+    }
+    if (path == "/lock/acquire" && request.method == "POST") {
+      return HandleLockAcquire(request.body);
+    }
+    if (path == "/lock/release" && request.method == "POST") {
+      return HandleLockRelease(request.body);
+    }
+    if (path.rfind("/lock/", 0) == 0 && request.method == "GET") {
+      return HandleLockGet(UrlDecode(path.substr(6)));
+    }
+    if (path == "/mvcc/begin" && request.method == "POST") {
+      return HandleMvccBegin();
+    }
+    if (path == "/mvcc/commit" && request.method == "POST") {
+      return HandleMvccCommit(request.body);
+    }
+    if (path.rfind("/mvcc/tx/", 0) == 0 && request.method == "PUT") {
+      const std::string prefix = "/mvcc/tx/";
+      const auto tx_key_pos = path.find("/kv/", prefix.size());
+      if (tx_key_pos == std::string::npos) {
+        return Response(400, "Bad Request", "expected /mvcc/tx/<tx_id>/kv/<key>");
+      }
+      const std::string tx_id = path.substr(prefix.size(), tx_key_pos - prefix.size());
+      const std::string key = UrlDecode(path.substr(tx_key_pos + 4));
+      return HandleMvccWrite(tx_id, key, request.body);
+    }
+    if (path.rfind("/mvcc/kv/", 0) == 0 && request.method == "GET") {
+      const auto query_values = query ? ParseQuery(*query) : std::unordered_map<std::string, std::string>{};
+      const auto it = query_values.find("snapshot_ts");
+      return HandleMvccRead(
+          UrlDecode(path.substr(9)),
+          it == query_values.end() ? std::optional<std::string>{} : std::optional<std::string>{it->second});
+    }
+    if (path.rfind("/kv/", 0) == 0) {
+      const std::string key = UrlDecode(path.substr(4));
+      if (request.method == "GET") {
+        return HandleGet(key);
+      }
+      if (request.method == "PUT") {
+        return HandlePut(key, request.body);
+      }
+      return Response(405, "Method Not Allowed", "only GET and PUT are supported");
+    }
+    return Response(404, "Not Found", "unknown path");
+  } catch (const BadRequestError& ex) {
+    return Response(400, "Bad Request", ex.what());
+  } catch (const std::exception&) {
+    return Response(500, "Internal Server Error", "internal server error");
   }
-  return Response(404, "Not Found", "unknown path");
 }
 
-std::string NodeHttpServer::HandleGet(const std::string& key) {
+HttpResponse NodeHttpServer::HandleGet(const std::string& key) {
   ++kv_get_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/kv/" + key);
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -287,11 +230,11 @@ std::string NodeHttpServer::HandleGet(const std::string& key) {
   return Response(200, "OK", *value);
 }
 
-std::string NodeHttpServer::HandlePut(const std::string& key, const std::string& value) {
+HttpResponse NodeHttpServer::HandlePut(const std::string& key, const std::string& value) {
   ++kv_put_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/kv/" + key);
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -303,10 +246,10 @@ std::string NodeHttpServer::HandlePut(const std::string& key, const std::string&
   return Response(200, "OK", "stored");
 }
 
-std::string NodeHttpServer::HandleLockGet(const std::string& name) const {
+HttpResponse NodeHttpServer::HandleLockGet(const std::string& name) const {
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/lock/" + name);
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -323,11 +266,11 @@ std::string NodeHttpServer::HandleLockGet(const std::string& name) const {
   return Response(200, "OK", "owner=" + *owner);
 }
 
-std::string NodeHttpServer::HandleLockAcquire(const std::string& body) {
+HttpResponse NodeHttpServer::HandleLockAcquire(const std::string& body) {
   ++lock_acquire_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/lock/acquire");
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -343,11 +286,11 @@ std::string NodeHttpServer::HandleLockAcquire(const std::string& body) {
   return Response(200, "OK", "locked");
 }
 
-std::string NodeHttpServer::HandleLockRelease(const std::string& body) {
+HttpResponse NodeHttpServer::HandleLockRelease(const std::string& body) {
   ++lock_release_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/lock/release");
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -363,11 +306,11 @@ std::string NodeHttpServer::HandleLockRelease(const std::string& body) {
   return Response(200, "OK", "released");
 }
 
-std::string NodeHttpServer::HandleMvccBegin() {
+HttpResponse NodeHttpServer::HandleMvccBegin() {
   ++mvcc_begin_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/mvcc/begin");
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -384,11 +327,14 @@ std::string NodeHttpServer::HandleMvccBegin() {
       "tx_id=" + tx->tx_id + "\n" + "snapshot_ts=" + std::to_string(tx->snapshot_ts));
 }
 
-std::string NodeHttpServer::HandleMvccWrite(const std::string& tx_id, const std::string& key, const std::string& value) {
+HttpResponse NodeHttpServer::HandleMvccWrite(
+    const std::string& tx_id,
+    const std::string& key,
+    const std::string& value) {
   ++mvcc_write_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/mvcc/tx/" + tx_id + "/kv/" + key);
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -400,11 +346,11 @@ std::string NodeHttpServer::HandleMvccWrite(const std::string& tx_id, const std:
   return Response(200, "OK", "staged");
 }
 
-std::string NodeHttpServer::HandleMvccCommit(const std::string& body) {
+HttpResponse NodeHttpServer::HandleMvccCommit(const std::string& body) {
   ++mvcc_commit_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/mvcc/commit");
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -425,11 +371,11 @@ std::string NodeHttpServer::HandleMvccCommit(const std::string& body) {
   return Response(200, "OK", "commit_ts=" + std::to_string(result.commit_ts));
 }
 
-std::string NodeHttpServer::HandleMvccRead(const std::string& key, const std::optional<std::string>& snapshot_ts) const {
+HttpResponse NodeHttpServer::HandleMvccRead(const std::string& key, const std::optional<std::string>& snapshot_ts) const {
   ++mvcc_read_total_;
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/mvcc/kv/" + key + (snapshot_ts ? "?snapshot_ts=" + *snapshot_ts : ""));
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -449,10 +395,10 @@ std::string NodeHttpServer::HandleMvccRead(const std::string& key, const std::op
   return Response(200, "OK", *value);
 }
 
-std::string NodeHttpServer::HandleAddPeer(const std::string& body) {
+HttpResponse NodeHttpServer::HandleAddPeer(const std::string& body) {
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/admin/add-peer");
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -485,10 +431,10 @@ std::string NodeHttpServer::HandleAddPeer(const std::string& body) {
   return Response(200, "OK", "peer added");
 }
 
-std::string NodeHttpServer::HandleRemovePeer(const std::string& body) {
+HttpResponse NodeHttpServer::HandleRemovePeer(const std::string& body) {
   if (node_->role() != Role::Leader) {
     auto redirect = RedirectToLeader("/admin/remove-peer");
-    if (!redirect.empty()) {
+    if (!redirect.body.empty()) {
       return redirect;
     }
     return Response(503, "Service Unavailable", "leader unknown");
@@ -567,7 +513,7 @@ std::string NodeHttpServer::HandleMetrics() const {
   return out.str();
 }
 
-std::string NodeHttpServer::RedirectToLeader(const std::string& path) const {
+HttpResponse NodeHttpServer::RedirectToLeader(const std::string& path) const {
   const int leader_id = node_->leader_id();
   if (leader_id < 0) {
     return {};
@@ -577,26 +523,21 @@ std::string NodeHttpServer::RedirectToLeader(const std::string& path) const {
     return {};
   }
 
-  std::ostringstream out;
-  const std::string body = "redirecting to leader";
-  out << "HTTP/1.1 307 Temporary Redirect\r\n";
-  out << "Location: http://" << peer->host << ":" << peer->http_port << path << "\r\n";
-  out << "X-Leader-Id: " << peer->id << "\r\n";
-  out << "Content-Type: text/plain\r\n";
-  out << "Content-Length: " << body.size() << "\r\n";
-  out << "Connection: close\r\n\r\n";
-  out << body;
-  return out.str();
+  HttpResponse response;
+  response.status_code = 307;
+  response.status_text = "Temporary Redirect";
+  response.body = "redirecting to leader";
+  response.headers.emplace_back("Location", "http://" + peer->host + ":" + std::to_string(peer->http_port) + path);
+  response.headers.emplace_back("X-Leader-Id", std::to_string(peer->id));
+  return response;
 }
 
-std::string NodeHttpServer::Response(int status_code, const std::string& status_text, const std::string& body) const {
-  std::ostringstream out;
-  out << "HTTP/1.1 " << status_code << ' ' << status_text << "\r\n";
-  out << "Content-Type: text/plain\r\n";
-  out << "Content-Length: " << body.size() << "\r\n";
-  out << "Connection: close\r\n\r\n";
-  out << body;
-  return out.str();
+HttpResponse NodeHttpServer::Response(int status_code, const std::string& status_text, const std::string& body) const {
+  HttpResponse response;
+  response.status_code = status_code;
+  response.status_text = status_text;
+  response.body = body;
+  return response;
 }
 
 std::optional<PeerEndpoint> NodeHttpServer::FindPeer(int id) const {

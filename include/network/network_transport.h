@@ -3,6 +3,7 @@
 #include "core/raft_transport.h"
 #include "network/network_codec.h"
 
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -10,6 +11,10 @@
 class NetworkTransport : public IRaftTransport {
 public:
   explicit NetworkTransport(std::vector<PeerEndpoint> peers);
+  ~NetworkTransport() override;
+
+  NetworkTransport(const NetworkTransport&) = delete;
+  NetworkTransport& operator=(const NetworkTransport&) = delete;
 
   RequestVoteResponse SendPreVote(int target_id, const RequestVoteRequest& request) override;
   RequestVoteResponse SendRequestVote(int target_id, const RequestVoteRequest& request) override;
@@ -22,6 +27,10 @@ public:
   bool FindPeer(int id, PeerEndpoint& peer) const;
 
 private:
+  struct Impl;
+
+  bool RoundTrip(int target_id, const std::string& request, std::string& response, int timeout_ms = 1000);
   mutable std::mutex mutex_;
   std::unordered_map<int, PeerEndpoint> peers_;
+  std::unique_ptr<Impl> impl_;
 };

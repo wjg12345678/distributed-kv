@@ -12,7 +12,6 @@ public:
   void Run();
 
 private:
-  void HandleClient(int client_fd) const;
   std::string Dispatch(const std::string& request) const;
 
   std::shared_ptr<RaftNode> node_;

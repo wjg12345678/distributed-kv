@@ -6,7 +6,7 @@
 ![Raft](https://img.shields.io/badge/Consensus-Raft-F28E2B)
 ![RocksDB](https://img.shields.io/badge/Storage-RocksDB-2E8B57)
 
-`distributed-kv` 是一个基于 C++17 实现的分布式键值存储系统，聚焦高一致性数据复制与状态机编排，覆盖了 Raft 共识、KV 状态机、RocksDB 持久化、HTTP 接入层以及多进程 TCP 通信。
+`distributed-kv` 是一个基于 C++17 实现的分布式键值存储系统，聚焦高一致性数据复制与状态机编排，覆盖了 Raft 共识、KV 状态机、RocksDB 持久化、`libuv + llhttp` HTTP 接入层以及基于 `libuv` 的多进程 TCP 通信。
 
 仓库同时提供单进程和多进程两种运行形态，便于在本地完成集群启动、读写验证、日志复制、快照恢复和状态机能力测试。
 
@@ -27,8 +27,8 @@
 - Snapshot / Log Compaction
 - 状态机应用到 KV 存储
 - RocksDB 持久化状态机数据和 Raft 元数据
-- 基于真实 TCP 的多进程 Raft RPC
-- 最小 HTTP 接口
+- 基于 `libuv` 长连接的多进程 Raft RPC
+- 基于 `libuv + llhttp` 的 HTTP 接入层
 - 基础输入校验和 `400 Bad Request` 错误返回
 - 锁服务
 - MVCC 读写与写写冲突检测
@@ -55,7 +55,7 @@ HTTP 接口
 Leader 节点
   |
   +--> 追加日志
-  +--> 通过 TCP + Protobuf 复制到 follower
+  +--> 通过 libuv TCP 长连接 + Protobuf 复制到 follower
   +--> 多数派确认后提交
   +--> 应用到状态机
               |
@@ -78,7 +78,7 @@ Leader 节点
 apps/                 可执行入口
 include/
   core/               Raft 核心类型、节点、持久化接口
-  network/            TCP、RPC、HTTP、任务执行器
+  network/            TCP 工具、libuv RPC、llhttp HTTP、任务执行器
   storage/            KV 存储抽象与 RocksDB 实现
 protos/               Protobuf 协议
 src/
@@ -97,6 +97,8 @@ tests/unit/           功能测试
 - Protobuf
 - `pkg-config`
 - RocksDB
+- `libuv`
+- `llhttp`
 
 注意：当前 `CMakeLists.txt` 会始终链接 RocksDB，所以即使你只想运行内存版单进程节点，也需要本机先安装 RocksDB 开发库和头文件。
 
@@ -162,7 +164,7 @@ curl http://127.0.0.1:9006/kv/name
 - 独立的 Raft RPC 端口
 - 独立的 HTTP 端口
 - 独立的 RocksDB 数据目录
-- 基于 TCP + Protobuf 的节点间通信
+- 基于 `libuv` 长连接 + Protobuf 的节点间通信
 
 启动一个 3 节点集群，分别在 3 个终端中运行：
 
@@ -416,7 +418,7 @@ ctest --test-dir build --output-on-failure
 - 预热测试 key
 - 将 `wrk` 原始输出保存到 `/tmp/distributed-kv-local-cluster/bench`
 
-当前记录的一组本地结果见 [docs/performance.md](docs/performance.md)。
+当前记录的一组本地结果见 [docs/performance.md](docs/performance.md)。截至 2026-05-07，这组本地基线约为：线性一致 `GET` `11.4k req/s`，`PUT` `281 req/s`。
 
 说明：这组结果是单机回环网络上的 correctness-first 基线，用于观察链路与尾延迟，不适合作为跨机器或生产环境吞吐结论。
 
@@ -424,6 +426,6 @@ ctest --test-dir build --output-on-failure
 
 - 成员变更当前通过两阶段配置日志完成 add / remove peer，接口仍然偏底层，节点 bootstrap / decommission 需要脚本配合
 - 线性一致读采用 ReadIndex 风格多数派确认路径，未引入 lease read
-- HTTP 接口与 TCP RPC 组件聚焦核心数据链路，鉴权、TLS、限流等能力可按部署需求继续扩展
+- HTTP 接口与 TCP RPC 组件当前已经切到 `libuv` 事件循环与 `llhttp` 解析，但仍未覆盖鉴权、TLS、限流、批处理和 RPC 多路复用
 - 压测结果基于单机回环网络，适合观察节点行为与本地性能特征
 - 单进程 `distributed_kv_http_server` 启动时会清理既有 `/tmp` 数据目录，适合本地验证环境

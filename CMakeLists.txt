@@ -10,6 +10,8 @@ include(CTest)
 find_package(PkgConfig REQUIRED)
 find_package(Protobuf REQUIRED)
 pkg_check_modules(PROTOBUF_ABSL REQUIRED IMPORTED_TARGET protobuf)
+pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
+pkg_check_modules(LIBLLHTTP REQUIRED IMPORTED_TARGET libllhttp)
 
 find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h
   HINTS
@@ -92,15 +94,17 @@ target_link_libraries(raft_mvcc_test PRIVATE distributed_kv)
 add_test(NAME raft_mvcc_test COMMAND $<TARGET_FILE:raft_mvcc_test>)
 
 add_executable(distributed_kv_http_server
+  src/network/libuv_http_server.cpp
   src/network/http_server.cpp
   apps/http_server_main.cpp
 )
-target_link_libraries(distributed_kv_http_server PRIVATE distributed_kv)
+target_link_libraries(distributed_kv_http_server PRIVATE distributed_kv PkgConfig::LIBUV PkgConfig::LIBLLHTTP)
 
 add_executable(distributed_kv_network_node
+  src/network/libuv_http_server.cpp
   src/network/network_transport.cpp
   src/network/raft_rpc_server.cpp
   src/network/node_http_server.cpp
   apps/network_node_main.cpp
 )
-target_link_libraries(distributed_kv_network_node PRIVATE distributed_kv)
+target_link_libraries(distributed_kv_network_node PRIVATE distributed_kv PkgConfig::LIBUV PkgConfig::LIBLLHTTP)

@@ -27,7 +27,9 @@ jobs:
             protobuf-compiler \
             libprotobuf-dev \
             librocksdb-dev \
-            libabsl-dev
+            libabsl-dev \
+            libuv1-dev \
+            libllhttp-dev
 
       - name: 配置
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

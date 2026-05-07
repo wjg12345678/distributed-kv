@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/cluster.h"
-#include "network/task_executor.h"
+#include "network/http_message.h"
 
 #include <cstddef>
 #include <string>
@@ -12,13 +12,12 @@ public:
   void Run();
 
 private:
-  void HandleClient(int client_fd);
-  std::string HandleRequest(const std::string& request);
-  std::string HandleGet(const std::string& key);
-  std::string HandlePut(const std::string& key, const std::string& value);
-  std::string Response(int status_code, const std::string& status_text, const std::string& body) const;
+  HttpResponse HandleRequest(const HttpRequest& request);
+  HttpResponse HandleGet(const std::string& key);
+  HttpResponse HandlePut(const std::string& key, const std::string& value);
+  HttpResponse Response(int status_code, const std::string& status_text, const std::string& body) const;
 
   Cluster* cluster_ = nullptr;
   int port_ = 0;
-  TaskExecutor executor_;
+  std::size_t worker_count_ = 0;
 };
