@@ -112,7 +112,9 @@ private:
   std::unordered_set<std::uint64_t> blocked_links_;
 };
 
-int main() {
+namespace {
+
+void RunPreVoteRecoveryTrial() {
   PartitionableCluster cluster;
   cluster.AddNode(std::make_shared<RaftNode>(
       1,
@@ -174,6 +176,14 @@ int main() {
   assert(*cluster.LeaderId() == *leader_id);
   assert(leader->current_term() == stable_term);
   assert(isolated->current_term() == stable_term);
+}
+
+}  // namespace
+
+int main() {
+  for (int trial = 0; trial < 20; ++trial) {
+    RunPreVoteRecoveryTrial();
+  }
 
   return 0;
 }

@@ -303,6 +303,10 @@ RequestVoteResponse RaftNode::HandlePreVote(const RequestVoteRequest& request) {
     return RequestVoteResponse{current_term_, false};
   }
 
+  if (HasRecentLeaderContactLocked()) {
+    return RequestVoteResponse{current_term_, false};
+  }
+
   return RequestVoteResponse{
       current_term_,
       IsCandidateLogUpToDate(request.last_log_index, request.last_log_term),
@@ -963,6 +967,13 @@ bool RaftNode::ConfirmLeaderForReadLocked() {
 
 bool RaftNode::HasCommittedCurrentTermEntry() const {
   return commit_index_ > 0 && TermAt(commit_index_) == current_term_;
+}
+
+bool RaftNode::HasRecentLeaderContactLocked() const {
+  if (role_ == Role::Leader) {
+    return true;
+  }
+  return leader_id_ != -1 && election_elapsed_ < heartbeat_interval_ticks_ * 2;
 }
 
 bool RaftNode::IsCandidateLogUpToDate(int last_log_index, int last_log_term) const {

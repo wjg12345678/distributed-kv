@@ -6,14 +6,21 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <charconv>
 #include <optional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace {
+
+class BadRequestError : public std::runtime_error {
+public:
+  explicit BadRequestError(const std::string& message) : std::runtime_error(message) {}
+};
 
 std::optional<std::string> ExtractHeaderValue(const std::string& request, const std::string& header_name) {
   const std::string pattern = header_name + ": ";
@@ -29,11 +36,58 @@ std::optional<std::string> ExtractHeaderValue(const std::string& request, const 
   return request.substr(start, end - start);
 }
 
-std::string UrlDecode(std::string value) {
-  for (char& ch : value) {
+int HexValue(char ch) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return ch - 'a' + 10;
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return ch - 'A' + 10;
+  }
+  return -1;
+}
+
+std::string UrlDecode(std::string_view value) {
+  std::string decoded;
+  decoded.reserve(value.size());
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    char ch = value[i];
     if (ch == '+') {
-      ch = ' ';
+      decoded.push_back(' ');
+      continue;
     }
+    if (ch == '%') {
+      if (i + 2 >= value.size()) {
+        throw BadRequestError("invalid url encoding");
+      }
+      const int high = HexValue(value[i + 1]);
+      const int low = HexValue(value[i + 2]);
+      if (high < 0 || low < 0) {
+        throw BadRequestError("invalid url encoding");
+      }
+      decoded.push_back(static_cast<char>((high << 4) | low));
+      i += 2;
+      continue;
+    }
+    decoded.push_back(ch);
+  }
+  return decoded;
+}
+
+template <typename Integer>
+Integer ParseIntegerOrThrow(std::string_view raw, const char* field_name) {
+  if (raw.empty()) {
+    throw BadRequestError(std::string("missing ") + field_name);
+  }
+
+  Integer value{};
+  const auto* begin = raw.data();
+  const auto* end = raw.data() + raw.size();
+  const auto result = std::from_chars(begin, end, value);
+  if (result.ec != std::errc() || result.ptr != end) {
+    throw BadRequestError(std::string("invalid ") + field_name);
   }
   return value;
 }
@@ -46,7 +100,7 @@ std::unordered_map<std::string, std::string> ParseKeyValueString(const std::stri
     const auto piece = body.substr(start, next == std::string::npos ? std::string::npos : next - start);
     const auto eq = piece.find('=');
     if (eq != std::string::npos) {
-      values[piece.substr(0, eq)] = UrlDecode(piece.substr(eq + 1));
+      values[UrlDecode(piece.substr(0, eq))] = UrlDecode(piece.substr(eq + 1));
     }
     if (next == std::string::npos) {
       break;
@@ -108,24 +162,31 @@ void NodeHttpServer::Run() {
 }
 
 void NodeHttpServer::HandleClient(int client_fd) {
-  std::string request;
-  char buffer[4096];
-  ssize_t bytes = 0;
-  while ((bytes = ::recv(client_fd, buffer, sizeof(buffer), 0)) > 0) {
-    request.append(buffer, static_cast<std::size_t>(bytes));
-    auto header_end = request.find("\r\n\r\n");
-    if (header_end != std::string::npos) {
-      std::size_t expected_body = 0;
-      if (auto content_length = ExtractHeaderValue(request, "Content-Length")) {
-        expected_body = static_cast<std::size_t>(std::stoul(*content_length));
-      }
-      if (request.size() >= header_end + 4 + expected_body) {
-        break;
+  std::string response;
+  try {
+    std::string request;
+    char buffer[4096];
+    ssize_t bytes = 0;
+    while ((bytes = ::recv(client_fd, buffer, sizeof(buffer), 0)) > 0) {
+      request.append(buffer, static_cast<std::size_t>(bytes));
+      auto header_end = request.find("\r\n\r\n");
+      if (header_end != std::string::npos) {
+        std::size_t expected_body = 0;
+        if (auto content_length = ExtractHeaderValue(request, "Content-Length")) {
+          expected_body = ParseIntegerOrThrow<std::size_t>(*content_length, "Content-Length");
+        }
+        if (request.size() >= header_end + 4 + expected_body) {
+          break;
+        }
       }
     }
+    response = HandleRequest(request);
+  } catch (const BadRequestError& ex) {
+    response = Response(400, "Bad Request", ex.what());
+  } catch (const std::exception&) {
+    response = Response(500, "Internal Server Error", "internal server error");
   }
 
-  const auto response = HandleRequest(request);
   ::send(client_fd, response.data(), response.size(), 0);
   ::close(client_fd);
 }
@@ -378,7 +439,9 @@ std::string NodeHttpServer::HandleMvccRead(const std::string& key, const std::op
     return Response(503, "Service Unavailable", "read quorum unavailable");
   }
 
-  const std::uint64_t ts = snapshot_ts ? static_cast<std::uint64_t>(std::stoull(*snapshot_ts)) : std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t ts = snapshot_ts
+      ? ParseIntegerOrThrow<std::uint64_t>(*snapshot_ts, "snapshot_ts")
+      : std::numeric_limits<std::uint64_t>::max();
   const auto value = node_->ReadMvcc(key, ts);
   if (!value) {
     return Response(404, "Not Found", "mvcc version not found");
@@ -401,10 +464,10 @@ std::string NodeHttpServer::HandleAddPeer(const std::string& body) {
   }
 
   PeerEndpoint peer;
-  peer.id = std::stoi(values.at("id"));
+  peer.id = ParseIntegerOrThrow<int>(values.at("id"), "id");
   peer.host = values.at("host");
-  peer.raft_port = std::stoi(values.at("raft_port"));
-  peer.http_port = std::stoi(values.at("http_port"));
+  peer.raft_port = ParseIntegerOrThrow<int>(values.at("raft_port"), "raft_port");
+  peer.http_port = ParseIntegerOrThrow<int>(values.at("http_port"), "http_port");
   if (!node_->AddPeer(peer)) {
     return Response(500, "Internal Server Error", "add-peer not committed");
   }
@@ -435,7 +498,7 @@ std::string NodeHttpServer::HandleRemovePeer(const std::string& body) {
   if (!values.count("id")) {
     return Response(400, "Bad Request", "expected id");
   }
-  const int peer_id = std::stoi(values.at("id"));
+  const int peer_id = ParseIntegerOrThrow<int>(values.at("id"), "id");
   if (!node_->RemovePeer(peer_id)) {
     return Response(500, "Internal Server Error", "remove-peer not committed");
   }

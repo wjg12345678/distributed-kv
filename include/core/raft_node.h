@@ -78,6 +78,7 @@ private:
   void PersistState();
   bool ConfirmLeaderForReadLocked();
   bool HasCommittedCurrentTermEntry() const;
+  bool HasRecentLeaderContactLocked() const;
   bool IsCandidateLogUpToDate(int last_log_index, int last_log_term) const;
   bool HasLogIndex(int global_index) const;
   int FindFirstIndexOfTerm(int term, int hint_index) const;

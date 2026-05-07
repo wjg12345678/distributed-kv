@@ -44,10 +44,13 @@
 - RocksDB 持久化状态机数据和 Raft 元数据
 - 基于真实 TCP 的多进程 Raft RPC
 - 最小 HTTP 接口
+- 基础输入校验和 `400 Bad Request` 错误返回
 - 锁服务
 - 简化版 MVCC 读写与写写冲突检测
 - 简化版成员动态变更接口
 - 基础 metrics 输出
+- `CTest` 回归测试和 GitHub Actions CI
+- 本地 3 节点启动 / demo / benchmark 脚本
 
 ## 架构概览
 
@@ -159,7 +162,7 @@ curl http://127.0.0.1:9006/kv/name
 这个入口只暴露最小 KV API：
 
 - `PUT /kv/<key>`：请求体原样作为 value
-- `GET /kv/<key>`：读取 value
+- `GET /kv/<key>`：leader 先做多数派确认，再读取 value
 
 ### 3. 多进程真实网络版
 
@@ -229,6 +232,23 @@ curl http://127.0.0.1:9201/kv/alpha
 ```
 
 如果请求打到 follower，且它知道 leader，服务会返回 `307 Temporary Redirect`。想对任意节点发请求时，可以使用 `curl -L` 自动跟随跳转。
+
+### 4. 本地 3 节点脚本
+
+如果只是想快速演示，不想手动开 3 个终端，可以直接使用仓库里的脚本：
+
+```bash
+./scripts/run_local_cluster.sh start
+./scripts/run_local_cluster.sh status
+./scripts/demo_local_cluster.sh
+./scripts/run_local_cluster.sh stop
+```
+
+说明：
+
+- `scripts/run_local_cluster.sh` 支持 `start|stop|restart|status`
+- `scripts/demo_local_cluster.sh` 会自动启动集群、写入一条 KV、展示 follower 的 `307 Temporary Redirect`，再读取指标
+- 默认运行目录是 `/tmp/distributed-kv-local-cluster`
 
 ## 多进程节点 HTTP API
 
@@ -364,16 +384,38 @@ curl -L -X POST http://127.0.0.1:9201/admin/remove-peer \
 运行：
 
 ```bash
-./build/raft_smoke_test
+ctest --test-dir build --output-on-failure
+```
+
+如果想单独跑某个二进制，也可以直接执行：
+
+```bash
 ./build/raft_prevote_test
 ./build/raft_linearizable_read_test
-./build/raft_conflict_test
-./build/raft_persistence_test
-./build/raft_snapshot_test
-./build/raft_membership_test
-./build/raft_lock_test
-./build/raft_mvcc_test
 ```
+
+仓库还包含 GitHub Actions CI 配置：
+
+- `.github/workflows/ci.yml`
+- 默认流程：安装依赖、`cmake` 构建、`ctest` 回归
+
+## 压测
+
+当前仓库提供了多进程网络版的本地压测脚本：
+
+```bash
+./bench/run_network_bench.sh get
+./bench/run_network_bench.sh put
+```
+
+脚本会：
+
+- 自动拉起本地 3 节点集群
+- 自动探测当前 leader
+- 预热测试 key
+- 将 `wrk` 原始输出保存到 `/tmp/distributed-kv-local-cluster/bench`
+
+当前记录的一组本地结果见 [docs/performance.md](docs/performance.md)。
 
 ## 面试建议
 
@@ -392,4 +434,6 @@ curl -L -X POST http://127.0.0.1:9201/admin/remove-peer \
 - 成员变更是简化版本，没有实现 joint consensus
 - 线性一致读当前走的是 ReadIndex 风格多数派确认，不是 lease read
 - HTTP server 和 TCP RPC server 都是最小手写实现，没有鉴权、TLS 或复杂流控
+- 多进程 benchmark 目前是单机 loopback 结果，不是跨机器部署数据
+- 还没有做优雅退出、配置文件化和系统化混沌测试
 - 单进程 `distributed_kv_http_server` 启动时会删除已有 `/tmp` 数据目录

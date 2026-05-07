@@ -1,11 +1,11 @@
 # Distributed KV Performance Notes
 
-这份文档记录一次可复现的本地压测结果，目标是给秋招面试提供“我不只实现了功能，还实际跑过压测”的证据。
+这份文档记录当前仓库一组可复现的本地 benchmark，目标是给秋招面试提供“我不只实现了功能，还真正拉起多进程集群跑过压测”的证据。
 
 ## 测试对象
 
-- 可执行文件：`./build/distributed_kv_http_server`
-- 运行形态：单进程 3 节点集群
+- 可执行文件：`./build/distributed_kv_network_node`
+- 运行形态：本机 loopback 上的 3 节点多进程集群
 - 状态机后端：RocksDB
 - 接口：
   - `GET /kv/bench`
@@ -13,109 +13,99 @@
 
 说明：
 
-- 这个入口本质上仍然是 Raft 集群，只是 3 个节点运行在同一进程里，便于稳定复现
-- `GET /kv/<key>` 不是“裸本地读”，当前实现会先做 leader 多数派确认，再读取本地状态机
-- 因为 HTTP server 是最小手写实现，响应默认 `Connection: close`，压测脚本也显式带了 `Connection: close`
+- 每轮 benchmark 都在 fresh cluster 上单独运行，避免上一轮压测污染下一轮结果
+- `GET /kv/<key>` 不是“leader 直接读本地内存”，当前实现会先做 leader 多数派确认，再读取状态机
+- HTTP server 仍然是最小手写实现，响应默认 `Connection: close`
 
 ## 环境
 
 - OS：macOS 14.7.2
 - Kernel：Darwin 23.6.0 x86_64
-- 日期：2026-05-06
+- 日期：2026-05-07
 
-## 压测脚本
+## 复现方式
 
-仓库中提供了可复现脚本：
-
-- [bench/wrk_get.lua](/Users/mac/distributed-kv/bench/wrk_get.lua)
-- [bench/wrk_put.lua](/Users/mac/distributed-kv/bench/wrk_put.lua)
-
-## 压测方法
-
-先启动服务：
+先构建：
 
 ```bash
-./build/distributed_kv_http_server
+cmake -S . -B build
+cmake --build build -j
 ```
 
-预热并写入测试 key：
+然后分别运行 GET / PUT 压测：
 
 ```bash
-curl -X PUT http://127.0.0.1:9006/kv/bench -d 'benchmark-value'
+./bench/run_network_bench.sh get
+./bench/run_network_bench.sh put
 ```
 
-读压测：
+脚本会自动：
 
-```bash
-wrk -t4 -c16 -d15s --latency -s bench/wrk_get.lua http://127.0.0.1:9006
-```
-
-写压测：
-
-```bash
-wrk -t4 -c8 -d15s --latency -s bench/wrk_put.lua http://127.0.0.1:9006
-```
+- 拉起本地 3 节点集群
+- 探测当前 leader
+- 预热 `bench` key
+- 将原始输出保存到 `/tmp/distributed-kv-local-cluster/bench/get.txt` 和 `/tmp/distributed-kv-local-cluster/bench/put.txt`
 
 ## 结果
 
 | 场景 | 并发 | 时长 | Requests/sec | p50 | p90 | p99 |
 |------|------|------|--------------|-----|-----|-----|
-| `GET /kv/bench` | 16 | 15s | 1087.74 | 321us | 442us | 600us |
-| `PUT /kv/bench` | 8 | 15s | 1080.61 | 1.58ms | 3.67ms | 41.59ms |
+| `GET /kv/bench` | 16 | 15s | 539.31 | 1.64ms | 7.71ms | 134.60ms |
+| `PUT /kv/bench` | 8 | 15s | 216.79 | 4.67ms | 13.23ms | 154.77ms |
 
 补充观察：
 
-- GET 的中位延迟显著低于 PUT，因为 PUT 需要真正提交日志并应用状态机
-- GET 吞吐没有明显高于 PUT，是因为当前实现的线性一致读需要先做多数派确认，不是“leader 直接本地读”
-- PUT 的 p99 明显高于 p50，说明在最小实现里尾延迟受日志复制、线程调度和 RocksDB 写入影响更大
+- GET 的中位延迟明显低于 PUT，但它仍然要先做多数派确认，所以吞吐不会像“裸本地读”那样高
+- PUT 吞吐显著低于 GET，因为它要真正走日志复制、提交和状态机 apply
+- 多进程 loopback 结果比单进程演示入口更接近真实分布式形态，但仍然不是跨机器部署基准
+- p99 明显高于 p50，说明在最小实现里尾延迟仍受连接关闭、线程调度、RocksDB 写入和 Raft RPC 往返影响
 
 ## 原始输出
 
 ### GET
 
 ```text
-Running 15s test @ http://127.0.0.1:9006
+Running 15s test @ http://127.0.0.1:9201
   4 threads and 16 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   336.68us   81.46us   1.03ms   73.73%
-    Req/Sec     3.72k     1.89k    5.05k    81.82%
+    Latency     5.85ms   22.94ms 295.84ms   97.30%
+    Req/Sec     1.07k   363.04     1.66k    80.00%
   Latency Distribution
-     50%  321.00us
-     75%  379.00us
-     90%  442.00us
-     99%  600.00us
-  16323 requests in 15.01s, 1.54MB read
-Requests/sec:   1087.74
-Transfer/sec:    105.16KB
+     50%    1.64ms
+     75%    2.01ms
+     90%    7.71ms
+     99%  134.60ms
+  8144 requests in 15.10s, 787.36KB read
+Requests/sec:    539.31
+Transfer/sec:     52.14KB
 ```
 
 ### PUT
 
 ```text
-Running 15s test @ http://127.0.0.1:9006
+Running 15s test @ http://127.0.0.1:9201
   4 threads and 8 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.90ms    8.15ms 137.29ms   97.62%
-    Req/Sec     0.92k   305.05     1.37k    74.16%
+    Latency    12.15ms   31.33ms 408.33ms   94.04%
+    Req/Sec   234.93    101.45   444.00     64.44%
   Latency Distribution
-     50%    1.58ms
-     75%    2.43ms
-     90%    3.67ms
-     99%   41.59ms
-  16311 requests in 15.09s, 1.38MB read
-Requests/sec:   1080.61
-Transfer/sec:     93.92KB
+     50%    4.67ms
+     75%    5.45ms
+     90%   13.23ms
+     99%  154.77ms
+  3255 requests in 15.01s, 282.91KB read
+Requests/sec:    216.79
+Transfer/sec:     18.84KB
 ```
 
 ## 面试时怎么说
 
 可以直接概括成下面这句话：
 
-我用本地 3 节点单进程集群做过一轮 `wrk` 压测，GET 和 PUT 都大约在 1k req/s 量级。因为 GET 当前实现的是线性一致读，不是裸本地读，所以它的吞吐没有和 PUT 拉开数量级差距，但中位延迟仍明显更低。
+我用本地 3 节点多进程集群做过一轮 `wrk` 压测。线性一致 `GET` 大约 540 req/s，`PUT` 大约 217 req/s。因为 GET 不是裸本地读，而是先做多数派确认，所以它的吞吐不会像缓存那样高，但中位延迟仍明显低于 PUT。
 
 ## 局限
 
-- 这是开发机上的本地 benchmark，不是生产环境基准
-- 测试对象是单进程 HTTP server，不是多进程跨机器部署
-- 当前 HTTP 实现是最小版本，没有 keep-alive、连接池、线程模型优化和批量提交
-- 结果更适合作为“做过性能验证”的证据，而不是对外宣称的最终性能指标
+- 这是单机 loopback 环境，不是跨机器生产网络
+- 当前 HTTP server 默认 `Connection: close`，没有 keep-alive、连接池和批量提交优化
+- benchmark 更适合作为“做过性能验证”的证据，而不是对外宣称的最终性能指标
