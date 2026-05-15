@@ -10,11 +10,13 @@
 
 仓库同时提供单进程和多进程两种运行形态，便于在本地完成集群启动、读写验证、日志复制、快照恢复和状态机能力测试。
 
-进一步的图示、实现说明和压测结果可以参考：
+进一步的图示、实现说明、学习路线和面试材料可以参考：
 
 - [docs/architecture.md](docs/architecture.md)
 - [docs/implementation_notes.md](docs/implementation_notes.md)
 - [docs/performance.md](docs/performance.md)
+- [docs/project-study-guide-complete.md](docs/project-study-guide-complete.md)
+- [docs/interview-qna-complete.md](docs/interview-qna-complete.md)
 
 ## 已实现能力
 
