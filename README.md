@@ -18,6 +18,9 @@
 - [完整学习指南](docs/project-study-guide-complete.md)
 - [面试问题完整回答](docs/面试问题完整回答.md)
 - [源码逐文件导读](docs/source-code-walkthrough-complete.md)
+- [一致性答辩手册](docs/consistency-defense-playbook.md)
+- [生产化加固路线](docs/production-hardening-roadmap.md)
+- [故障演练手册](docs/failure-drill-runbook.md)
 
 ## 已实现能力
 
