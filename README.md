@@ -12,6 +12,7 @@
 
 进一步的图示、实现说明、学习路线和面试材料可以参考：
 
+- [docs/README.md](docs/README.md)
 - [docs/architecture.md](docs/architecture.md)
 - [docs/implementation_notes.md](docs/implementation_notes.md)
 - [docs/performance.md](docs/performance.md)
