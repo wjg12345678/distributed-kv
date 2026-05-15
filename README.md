@@ -15,8 +15,9 @@
 - [docs/architecture.md](docs/architecture.md)
 - [docs/implementation_notes.md](docs/implementation_notes.md)
 - [docs/performance.md](docs/performance.md)
-- [docs/project-study-guide-complete.md](docs/project-study-guide-complete.md)
-- [docs/interview-qna-complete.md](docs/interview-qna-complete.md)
+- [完整学习指南](docs/project-study-guide-complete.md)
+- [面试问题完整回答](docs/面试问题完整回答.md)
+- [源码逐文件导读](docs/source-code-walkthrough-complete.md)
 
 ## 已实现能力
 
@@ -115,7 +116,7 @@ cmake --build build -j
 
 - `build/distributed_kv_single_process`：单进程、内存版 3 节点实例
 - `build/distributed_kv_http_server`：单进程、RocksDB 版 HTTP 服务
-- `build/distributed_kv_network_node`：多进程、真实 TCP 网络节点
+- `build/distributed_kv_network_node`：多进程、真实 libuv TCP 网络节点
 - `build/raft_*_test`：功能测试
 
 ## 运行方式

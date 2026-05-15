@@ -53,7 +53,7 @@ flowchart LR
 ## 模块职责
 
 - `RaftNode`：选举、日志复制、commit、apply、snapshot、成员关系维护
-- `IRaftTransport` / `NetworkTransport`：抽象传输层，支持单进程 mock 和真实 TCP 网络版
+- `IRaftTransport` / `NetworkTransport`：抽象传输层，支持单进程 mock 和真实 libuv TCP 网络版
 - `NodeHttpServer` / `HttpServer`：暴露 KV、锁、MVCC、状态和指标接口
 - `RocksDbKeyValueStore`：持久化状态机数据
 - `RocksDbRaftPersistence`：持久化 `current_term`、`voted_for`、日志和 snapshot 元数据

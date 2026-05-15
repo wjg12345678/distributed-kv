@@ -12,7 +12,7 @@
 
 可以这样介绍：
 
-> 这个项目实现了一个基于 Raft 的分布式 KV。客户端请求先进入 leader，leader 把写操作追加为日志并复制给 follower，多数派确认后推进 commit index，再按日志顺序应用到状态机。项目还补充了 Pre-Vote、ReadIndex 风格线性一致读、快照压缩、InstallSnapshot、RocksDB 持久化、TCP + Protobuf 多进程通信、HTTP 接口、分布式锁、MVCC 和成员变更接口。
+> 这个项目实现了一个基于 Raft 的分布式 KV。客户端请求先进入 leader，leader 把写操作追加为日志并复制给 follower，多数派确认后推进 commit index，再按日志顺序应用到状态机。项目还补充了 Pre-Vote、ReadIndex 风格线性一致读、快照压缩、InstallSnapshot、RocksDB 持久化、基于 libuv TCP 长连接 + Protobuf 的多进程通信、基于 libuv + llhttp 的 HTTP 接入层、分布式锁、MVCC 和成员变更接口。
 
 这段介绍要突出：
 
@@ -38,7 +38,8 @@
 - Snapshot / log compaction。
 - InstallSnapshot 给落后 follower 补状态。
 - RocksDB 持久化状态机和 Raft 元数据。
-- 多进程 TCP + Protobuf Raft RPC。
+- 基于 libuv TCP 长连接 + Protobuf 的多进程 Raft RPC。
+- 基于 libuv + llhttp 的 HTTP 接入层。
 - HTTP KV / lock / MVCC / admin / metrics 接口。
 - 锁服务和 MVCC 写写冲突检测。
 - 成员变更接口。
@@ -63,7 +64,7 @@
 apps/
   single_process_main.cpp      单进程内存集群入口
   http_server_main.cpp         单进程 RocksDB + HTTP 入口
-  network_node_main.cpp        多进程 TCP 节点入口
+  network_node_main.cpp        多进程 libuv TCP 节点入口
 
 include/core/
   raft_types.h                 Raft 核心数据结构
@@ -87,8 +88,9 @@ include/network/
 
 src/network/
   node_http_server.cpp         HTTP API 路由和业务调用
-  network_transport.cpp        TCP Raft RPC client
-  raft_rpc_server.cpp          TCP Raft RPC server
+  network_transport.cpp        libuv Raft RPC client，维护 peer 长连接
+  raft_rpc_server.cpp          libuv Raft RPC server，处理长度前缀帧
+  libuv_http_server.cpp        libuv + llhttp HTTP server
   network_codec.cpp            Protobuf 编解码
 
 include/storage/
@@ -150,7 +152,7 @@ curl http://127.0.0.1:9006/kv/name
 ./scripts/run_local_cluster.sh stop
 ```
 
-多进程版最适合简历展示，因为它包含真实 TCP、节点独立进程、独立数据目录和 HTTP 端口。
+多进程版最适合简历展示，因为它包含真实 libuv TCP 长连接、节点独立进程、独立数据目录和 HTTP 端口。
 
 ## 5. 一句话架构
 
@@ -742,7 +744,8 @@ curl -X POST http://127.0.0.1:9201/admin/remove-peer -d 'id=4'
 
 ### 第二优先级
 
-- TCP + Protobuf transport。
+- libuv TCP 长连接 + Protobuf transport。
+- libuv + llhttp HTTP server。
 - RocksDB 持久化。
 - HTTP API 和 redirect。
 - metrics。
@@ -762,11 +765,11 @@ curl -X POST http://127.0.0.1:9201/admin/remove-peer -d 'id=4'
 
 ### 30 秒版本
 
-> 我做了一个 C++17 的分布式 KV，核心是 Raft。写请求只能由 leader 处理，leader 追加日志并通过 AppendEntries 复制到 follower，多数派确认后推进 commit index，再按顺序 apply 到 KV 状态机。为了提高完整度，我还做了 Pre-Vote、当前 term no-op、线性一致读、快照压缩、InstallSnapshot、RocksDB 持久化、多进程 TCP 通信、HTTP 接口、锁和 MVCC。
+> 我做了一个 C++17 的分布式 KV，核心是 Raft。写请求只能由 leader 处理，leader 追加日志并通过 AppendEntries 复制到 follower，多数派确认后推进 commit index，再按顺序 apply 到 KV 状态机。为了提高完整度，我还做了 Pre-Vote、当前 term no-op、线性一致读、快照压缩、InstallSnapshot、RocksDB 持久化、libuv 多进程 TCP 通信、libuv + llhttp HTTP 接入、锁和 MVCC。
 
 ### 2 分钟版本
 
-> 项目分为 HTTP 接入层、Raft 共识层、网络 RPC 层和状态机存储层。HTTP 层负责把 KV、锁、MVCC、成员变更请求转换成状态机命令；RaftNode 负责选举、日志复制、提交和 apply；网络层用 TCP + Protobuf 传输 Raft RPC；存储层用 RocksDB 持久化状态机和 Raft 元数据。写路径会经过 leader 追加日志、复制、多数派提交、状态机 apply。读路径不是简单读本地，而是 leader 先向多数派确认自己仍然有效，再读本地状态机。项目也实现了 snapshot 和 InstallSnapshot，避免日志无限增长。生产边界上，成员变更还不是 joint consensus，HTTP 和安全治理也不是生产级。
+> 项目分为 HTTP 接入层、Raft 共识层、网络 RPC 层和状态机存储层。HTTP 层用 libuv + llhttp 解析请求并把 KV、锁、MVCC、成员变更请求转换成状态机命令；RaftNode 负责选举、日志复制、提交和 apply；网络层用 libuv TCP 长连接 + Protobuf 传输 Raft RPC；存储层用 RocksDB 持久化状态机和 Raft 元数据。写路径会经过 leader 追加日志、复制、多数派提交、状态机 apply。读路径不是简单读本地，而是 leader 先向多数派确认自己仍然有效，再读本地状态机。项目也实现了 snapshot 和 InstallSnapshot，避免日志无限增长。生产边界上，成员变更还不是 joint consensus，安全治理和运维能力也不是生产级。
 
 ## 24. 常见误区
 

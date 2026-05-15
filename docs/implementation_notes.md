@@ -4,13 +4,13 @@
 
 ## 概要
 
-`distributed-kv` 基于 C++17 实现，覆盖了 Raft 共识、RocksDB 持久化、快照压缩、线性一致读、多进程 TCP 通信以及面向 KV / 锁服务 / MVCC 的状态机扩展。
+`distributed-kv` 基于 C++17 实现，覆盖了 Raft 共识、RocksDB 持久化、快照压缩、线性一致读、基于 libuv TCP 长连接 + Protobuf 的多进程通信、基于 libuv + llhttp 的 HTTP 接入层，以及面向 KV / 锁服务 / MVCC 的状态机扩展。
 
 ## 核心能力
 
 - 完整的 Raft 主链路：Leader 选举、日志复制、冲突回退、当前 Term commit 约束、快照与 InstallSnapshot
 - 一致性边界补充：Pre-Vote 与 ReadIndex 风格线性一致读
-- 多进程网络形态：独立节点进程、TCP + Protobuf 节点通信、HTTP 接口与纯文本指标
+- 多进程网络形态：独立节点进程、libuv TCP 长连接 + Protobuf 节点通信、libuv + llhttp HTTP 接口与纯文本指标
 - 状态机扩展：KV、分布式锁、MVCC 读写与写写冲突检测
 - 工程配套：`ctest` 回归测试、多进程 smoke / e2e 脚本、`wrk` 压测脚本
 
@@ -26,7 +26,7 @@ HTTP 接口
 主节点 RaftNode
   |
   +--> 追加日志
-  +--> 通过 TCP + Protobuf 复制
+  +--> 通过 libuv TCP 长连接 + Protobuf 复制
   +--> 多数派提交
   +--> 应用到状态机
               |
